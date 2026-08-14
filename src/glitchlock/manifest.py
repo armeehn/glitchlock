@@ -37,6 +37,29 @@ class Layer:
     #: reproduce exactly. Empirically empty for mv and qscale.
     repairs: Dict[str, int] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        """Pin every numeric field's type, so the MAC input cannot drift.
+
+        The MAC is taken over ``json.dumps`` of this record, so the tag
+        depends on how Python *renders* each number, not only on its value.
+        JSON has a single number type and so does JavaScript, so a manifest
+        that travels through a browser -- which the web UI's "send to unlock"
+        does -- comes back with ``intensity`` 1.0 re-serialised as ``1``. Same
+        number, different byte string, so the tag stops matching and the user
+        is told their key is wrong or the manifest was altered. Both are
+        false, and nothing in the message hints that the manifest merely took
+        a different route home.
+
+        Coercing here is backward compatible: every manifest this tool has
+        written already holds a float intensity and integer counts, so their
+        canonical bytes are unchanged.
+        """
+        self.intensity = float(self.intensity)
+        self.frames = int(self.frames)
+        self.slots_total = int(self.slots_total)
+        self.slots_touched = int(self.slots_touched)
+        self.buckets = int(self.buckets)
+
 
 @dataclass
 class Manifest:
