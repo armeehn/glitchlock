@@ -60,6 +60,32 @@ the two compose fine.
 - Research on codec bitstream structure — the domain model and the round-trip
   harness are reusable on their own.
 
+## Public-key recipients
+
+`--recipient` adds hybrid encryption over the top: a random content key drives
+the scrambler, and that key is sealed to each recipient with X25519 → HKDF-SHA256
+→ ChaCha20-Poly1305, one fresh ephemeral keypair per recipient per lock. The
+manifest carries only the sealed copies.
+
+What it fixes: **key distribution**. You no longer need a shared secret, and the
+manifest can travel with the video without carrying anything that opens it.
+
+What it does not fix: everything in the section above. The ciphertext is still a
+playable video, the residual picture still survives, and the structure still
+leaks. Wrapping the content key in X25519 does not change one bit of what the
+locked video shows. If a reader concludes "it uses public keys, so it must be
+safe to publish the locked file", that conclusion is wrong.
+
+Two more limits worth stating plainly:
+
+- **No sender authentication.** This is a sealed box. Anyone holding your public
+  key can lock a file *to* you, and the manifest does not prove who did. If you
+  need to know who sent it, you need a signature layer, which does not exist yet.
+- **The fingerprint authorises nothing.** It is a lookup hint so unsealing can try
+  the right entry first. Access is decided solely by whether the X25519 exchange
+  and the AEAD tag work out. Forging a fingerprint gains an attacker nothing, and
+  there is a test for exactly that.
+
 ## Key handling
 
 - `--key-file` hashes the file's contents to 32 bytes; any file works, including

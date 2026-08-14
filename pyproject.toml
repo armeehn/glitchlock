@@ -18,6 +18,10 @@ classifiers = [
 ]
 dependencies = []
 
+[project.optional-dependencies]
+# Public-key recipients. The core scrambler stays stdlib-only.
+recipients = ["cryptography>=41"]
+
 [project.scripts]
 glitchlock = "glitchlock.cli:main"
 

@@ -142,6 +142,38 @@ $ glitchlock verify carrier.mpg
 round trip:  EXACT
 ```
 
+## Public-key recipients
+
+Lock a file for someone who has published a public key, with no shared secret:
+
+```console
+$ glitchlock keygen -o me.key
+identity:    me.key  (mode 0600 - keep it secret)
+public key:  glk-pub-v1:FAekY8ufscY1elddqOgee7hUPBxCcuPq3TnrCSt1Bko=
+fingerprint: ba688596449807df
+
+$ glitchlock lock carrier.mpg -o locked.mpg -m manifest.json \
+      --recipient glk-pub-v1:FAekY8ufscY1elddqOgee7hUPBxCcuPq3TnrCSt1Bko=
+recipients: 1 (ba688596449807df)
+
+$ glitchlock unlock locked.mpg -o restored.mpg -m manifest.json --identity me.key
+integrity: OK - byte-exact match with the original carrier
+```
+
+The asymmetric key never touches the video. This is ordinary hybrid encryption:
+a random 32-byte content key drives the scrambler, and that content key is
+sealed to each recipient with X25519 → HKDF-SHA256 → ChaCha20-Poly1305. The
+manifest carries the sealed copies and nothing else; opening one needs the
+matching private key. Repeat `--recipient` to lock for several people at once.
+
+Needs the `cryptography` package — `pip install 'glitchlock[recipients]'`. The
+core scrambler stays dependency-free.
+
+**This solves key distribution, not information leakage.** The locked video is
+still a playable video whose residual picture survives. Public keys make it
+practical to hand a locked file to someone; they do not make the ciphertext
+safe to publish. [SECURITY.md](SECURITY.md) is explicit about this.
+
 ## Streaming
 
 Yes, it works on a stream, at GOP granularity, and the round trip stays

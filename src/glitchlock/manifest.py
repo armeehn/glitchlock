@@ -54,6 +54,9 @@ class Manifest:
     #: present only when keyless: the seed the key was derived from
     seed: Optional[str] = None
     kdf: Optional[Dict[str, Any]] = None
+    #: present when locked to public keys: the wrapped content key per recipient.
+    #: Holds no secret on its own -- opening it needs a matching private key.
+    kem: Optional[Dict[str, Any]] = None
     carrier_sha256: str = ""
     carrier_bytes: int = 0
     locked_sha256: str = ""

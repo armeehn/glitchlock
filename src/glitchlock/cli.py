@@ -8,7 +8,7 @@ import os
 import sys
 from typing import Optional, Tuple
 
-from . import __version__, ffg
+from . import __version__, ffg, pubkey
 from .core import LockError, lock, lockable_features, select_features, unlock
 from .crypto import (
     SCRYPT_N,
@@ -37,8 +37,27 @@ def _report(msg: str) -> None:
 # --------------------------------------------------------------------- keys
 
 
-def _resolve_key_for_lock(args) -> Tuple[bytes, Optional[dict], bool, Optional[str]]:
-    """Return ``(key, kdf_params, keyless, seed_hex)``."""
+def _load_recipient(value: str) -> str:
+    """A recipient may be given inline or as a path to a key file."""
+    if value.startswith(pubkey.PUBLIC_PREFIX):
+        return value.strip()
+    if os.path.exists(value):
+        return pubkey.read_key_file(value)
+    raise LockError(
+        f"recipient {value!r} is neither a '{pubkey.PUBLIC_PREFIX}' key nor an "
+        "existing file"
+    )
+
+
+def _resolve_key_for_lock(args):
+    """Return ``(key, kdf_params, keyless, seed_hex, kem)``."""
+    recipients = getattr(args, "recipient", None)
+    if recipients:
+        keys = [_load_recipient(r) for r in recipients]
+        content_key = pubkey.new_content_key()
+        kem = pubkey.seal(content_key, keys)
+        return content_key, {"algo": "x25519-kem"}, False, None, kem
+
     if args.keyless:
         seed = random_salt()
         return (
@@ -46,12 +65,13 @@ def _resolve_key_for_lock(args) -> Tuple[bytes, Optional[dict], bool, Optional[s
             {"algo": "keyless", "note": "seed stored in manifest"},
             True,
             seed.hex(),
+            None,
         )
     if args.key_file:
-        return load_key_file(args.key_file), {"algo": "key-file-sha256"}, False, None
+        return load_key_file(args.key_file), {"algo": "key-file-sha256"}, False, None, None
     env = key_from_env()
     if env is not None:
-        return env, {"algo": "env-sha256"}, False, None
+        return env, {"algo": "env-sha256"}, False, None, None
     password = args.password or getpass.getpass("passphrase: ")
     if not password:
         raise LockError("empty passphrase")
@@ -64,12 +84,25 @@ def _resolve_key_for_lock(args) -> Tuple[bytes, Optional[dict], bool, Optional[s
         "salt": salt.hex(),
         "dklen": 32,
     }
-    return derive_key_from_password(password, salt), kdf, False, None
+    return derive_key_from_password(password, salt), kdf, False, None, None
 
 
 def _resolve_key_for_unlock(args, manifest: Manifest) -> bytes:
     kdf = manifest.kdf or {}
     algo = kdf.get("algo")
+
+    if manifest.kem:
+        identity = getattr(args, "identity", None)
+        if not identity:
+            fps = pubkey.recipient_fingerprints(manifest.kem)
+            raise LockError(
+                "this file was locked to public keys; pass --identity with your "
+                f"private key file. Recipients: {', '.join(fps) or 'none listed'}"
+            )
+        secret = (identity if identity.startswith(pubkey.SECRET_PREFIX)
+                  else pubkey.read_key_file(identity))
+        return pubkey.unseal(manifest.kem, secret)
+
     if manifest.keyless or algo == "keyless":
         if not manifest.seed:
             raise LockError("manifest claims to be keyless but carries no seed")
@@ -135,9 +168,25 @@ def cmd_prepare(args) -> int:
     return 0
 
 
+def cmd_keygen(args) -> int:
+    secret, public = pubkey.generate_identity()
+    if args.output:
+        pubkey.write_identity(args.output, secret, public)
+        print(f"identity:    {args.output}  (mode 0600 - keep it secret)")
+    else:
+        print(secret)
+    print(f"public key:  {public}")
+    print(f"fingerprint: {pubkey.fingerprint(public)}")
+    if args.output:
+        print()
+        print("Share the public key. Anyone holding it can lock a file for you;")
+        print("only this identity file can unlock one.")
+    return 0
+
+
 def cmd_lock(args) -> int:
     features = select_features(args.input, args.features.split(",") if args.features else None)
-    key, kdf, keyless, seed = _resolve_key_for_lock(args)
+    key, kdf, keyless, seed, kem = _resolve_key_for_lock(args)
     nonce = random_nonce()
 
     _report(f"locking {args.input}")
@@ -159,12 +208,17 @@ def cmd_lock(args) -> int:
     manifest.kdf = kdf
     manifest.keyless = keyless
     manifest.seed = seed
+    manifest.kem = kem
     manifest.sign(key)
     manifest.save(args.manifest)
 
     print(f"locked:   {args.output}")
     print(f"manifest: {args.manifest}")
     print(f"self-test: {manifest.selftest}")
+    if kem:
+        fps = pubkey.recipient_fingerprints(kem)
+        print(f"recipients: {len(fps)} ({', '.join(fps)})")
+        print("only a matching private key can unlock this")
     if keyless:
         print("mode: keyless - the manifest alone can unwind this file")
     total_repairs = sum(len(l.repairs) for l in manifest.layers)
@@ -263,6 +317,10 @@ def build_parser() -> argparse.ArgumentParser:
                         "independently lockable stream segments")
     p.set_defaults(func=cmd_prepare)
 
+    p = sub.add_parser("keygen", help="generate an X25519 identity for recipient mode")
+    p.add_argument("-o", "--output", help="write the private identity here (mode 0600)")
+    p.set_defaults(func=cmd_keygen)
+
     def add_key_args(sp):
         sp.add_argument("--key-file", help="file whose contents are hashed into the key")
         sp.add_argument("--password", help="passphrase (prompted if omitted)")
@@ -282,6 +340,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="store the seed in the manifest; manifest alone can unwind")
     p.add_argument("--no-selftest", action="store_true",
                    help="skip proving reversibility before writing the manifest")
+    p.add_argument("--recipient", action="append", metavar="PUBKEY",
+                   help="public key or key file; repeat for several recipients. "
+                        "Overrides passphrase and key-file modes.")
     add_key_args(p)
     p.set_defaults(func=cmd_lock)
 
@@ -289,6 +350,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("input")
     p.add_argument("-o", "--output", required=True)
     p.add_argument("-m", "--manifest", required=True)
+    p.add_argument("--identity", metavar="FILE",
+                   help="private identity file, for a file locked to public keys")
     add_key_args(p)
     p.set_defaults(func=cmd_unlock)
 
@@ -310,7 +373,10 @@ def main(argv=None) -> int:
     except ffg.FFglitchMissing as exc:
         _err(str(exc))
         return 4
-    except (LockError, ffg.FFglitchError, ValueError) as exc:
+    except pubkey.NotARecipient as exc:
+        _err(str(exc))
+        return 2
+    except (LockError, ffg.FFglitchError, pubkey.PubKeyError, ValueError) as exc:
         _err(str(exc))
         return 1
 

@@ -90,6 +90,29 @@ That removes the per-chunk sidecar entirely. What you give up:
   mis-restore those slots. A sender should check `layer.repairs` and refuse to
   run in manifest-free mode if it is ever non-empty.
 
+## Public-key sessions
+
+Recipients compose with streaming, but do the asymmetric work **once per
+session, not once per segment**:
+
+1. Seal a random session key to the subscriber's public key. Measured at
+   0.22 ms, producing a 241-byte handshake blob.
+2. Send that blob once, out of band or as a stream header.
+3. Lock every segment under the session key with its own segment number.
+4. The subscriber unseals once (0.07 ms) and then unlocks every segment from the
+   session key plus its own counter.
+
+Verified end to end: all segments recovered byte-exact, and an identity that is
+not a recipient is rejected at the handshake.
+
+Sealing per segment would also work and costs little, but it puts a KEM block in
+front of every GOP and gains nothing — the segment numbers already separate the
+keystreams. One handshake is the right shape, and it is what real streaming
+crypto does.
+
+Note that reusing one session key across segments is safe **only** because the
+segment numbers differ. That is the same trap as above, wearing a different hat.
+
 ## Latency
 
 One segment, by construction: a segment is only complete once the next one
