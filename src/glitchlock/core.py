@@ -51,6 +51,21 @@ class GeometryError(LockError):
     """The ciphertext no longer has the same slot layout as the plaintext."""
 
 
+def _discard(path: str) -> None:
+    """Remove a rejected lock output.
+
+    When `lock` refuses, the output file has already been written -- the
+    layers ran, the check comes after. Leaving it behind puts a file named
+    like ciphertext, containing plaintext, exactly where the user asked for
+    the real thing. The error says "no manifest was written", which reads as
+    "nothing was produced", so anything ignoring the exit status ships it.
+    """
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
 class NoOpLock(LockError):
     """The lock produced a byte-identical copy of the carrier.
 
@@ -234,6 +249,7 @@ def lock(
     manifest.locked_bytes = os.path.getsize(out_path)
 
     if not allow_noop and manifest.locked_sha256 == manifest.carrier_sha256:
+        _discard(out_path)
         # The self-test below would pass this happily -- a copy unlocks to
         # itself byte for byte -- so reversibility is the wrong question to
         # ask here. The right one is whether anything was scrambled at all.
@@ -251,7 +267,8 @@ def lock(
             "An all-intra carrier has no motion vectors to scramble, and "
             "permuting values that are all equal is the identity. Re-encode "
             "with a GOP longer than 1, choose different --features/--mode, or "
-            "pass --allow-noop if you really want a copy. No manifest written."
+            "pass --allow-noop if you really want a copy. "
+            "No manifest was written and the output file was removed."
         )
 
     selftest_ok: Optional[bool] = None
@@ -266,10 +283,12 @@ def lock(
             shutil.rmtree(probe_dir, ignore_errors=True)
         manifest.selftest = "pass" if selftest_ok else "FAIL"
         if not selftest_ok:
+            _discard(out_path)
             raise LockError(
                 "self-test failed: unlocking the locked file did not reproduce the "
-                "carrier byte for byte. No manifest was written. Please report this "
-                "with the codec and FFglitch version."
+                "carrier byte for byte. No manifest was written and the output "
+                "file was removed. Please report this with the codec and "
+                "FFglitch version."
             )
         report("  self-test: pass (byte-exact)")
 
