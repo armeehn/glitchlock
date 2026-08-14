@@ -203,6 +203,7 @@ def cmd_lock(args) -> int:
         selftest=not args.no_selftest,
         report=_report,
         segment=args.segment,
+        allow_noop=args.allow_noop,
     )
     manifest = result.manifest
     manifest.kdf = kdf
@@ -255,38 +256,95 @@ def cmd_unlock(args) -> int:
     return 0
 
 
+def _verify_once(args, features, key, nonce, workdir):
+    """One lock+unlock round trip. Returns (verdict, touched, repairs)."""
+    import hashlib
+
+    tag = hashlib.sha256(nonce).hexdigest()[:8]
+    locked_path = os.path.join(workdir, f"locked-{tag}.bin")
+    restored_path = os.path.join(workdir, f"restored-{tag}.bin")
+
+    result = lock(
+        args.input, locked_path, key=key, nonce=nonce, features=features,
+        mode=args.mode, intensity=args.intensity, selftest=False, report=_report,
+        # verify reports a no-op itself, below, and exits non-zero for it;
+        # let it reach that line rather than raising out of lock().
+        allow_noop=True,
+    )
+    unlock(locked_path, restored_path, key=key, manifest=result.manifest,
+           report=_report)
+
+    original = sha256_file(args.input)
+    restored = sha256_file(restored_path)
+    changed = sha256_file(locked_path) != original
+    repairs = sum(len(l.repairs) for l in result.manifest.layers)
+    touched = sum(l.slots_touched for l in result.manifest.layers)
+
+    if original != restored:
+        verdict = "MISMATCH"
+    elif not changed:
+        verdict = "NO-OP"
+    else:
+        verdict = "EXACT"
+    return verdict, touched, repairs
+
+
 def cmd_verify(args) -> int:
-    """Lock and unlock a file in a scratch directory and report the outcome."""
+    """Lock and unlock a file in a scratch directory and report the outcome.
+
+    The nonce is derived from the run index rather than drawn at random, so a
+    verify result is reproducible. That matters more than it sounds: some
+    carriers round trip for most nonces and fail for a few -- measured on an
+    interlaced MPEG-4 carrier, 10 of 12 random nonces passed and 2 raised a
+    geometry error. With a random nonce, a single green run was being read as
+    proof the carrier was safe. Use --repeat to buy more confidence.
+    """
+    import hashlib
     import shutil
     import tempfile
 
     features = select_features(args.input, args.features.split(",") if args.features else None)
     workdir = tempfile.mkdtemp(prefix="glitchlock-verify-")
     try:
-        locked_path = os.path.join(workdir, "locked.bin")
-        restored_path = os.path.join(workdir, "restored.bin")
         key = load_key_file(args.key_file) if args.key_file else b"\x00" * 32
-        nonce = random_nonce()
+        verdicts = []
+        for run in range(args.repeat):
+            if args.random_nonce:
+                nonce = random_nonce()
+            else:
+                nonce = hashlib.sha256(
+                    f"glitchlock-verify|{run}".encode("utf-8")
+                ).digest()[:16]
+            try:
+                verdict, touched, repairs = _verify_once(
+                    args, features, key, nonce, workdir)
+            except LockError as exc:
+                # A failing nonce must not abort the sweep -- the whole point of
+                # --repeat is to find the nonces that fail, so record and go on.
+                verdict, touched, repairs = "FAILED", 0, 0
+                _err(str(exc).splitlines()[0])
+            verdicts.append(verdict)
+            if args.repeat > 1:
+                print(f"run {run + 1}/{args.repeat}:  {verdict}"
+                      f"  ({touched} slots, {repairs} repairs)")
+            else:
+                print(f"features:   {', '.join(features)}")
+                print(f"slots kept:  {touched} scrambled")
+                print(f"repairs:     {repairs}")
+                print("ciphertext differs from plaintext: "
+                      f"{'yes' if verdict != 'NO-OP' else 'NO (suspicious)'}")
+                print(f"round trip:  "
+                      f"{'EXACT' if verdict != 'MISMATCH' else 'MISMATCH'}")
 
-        result = lock(
-            args.input, locked_path, key=key, nonce=nonce, features=features,
-            mode=args.mode, intensity=args.intensity, selftest=False, report=_report,
-        )
-        unlock(locked_path, restored_path, key=key, manifest=result.manifest,
-               report=_report)
-
-        original = sha256_file(args.input)
-        restored = sha256_file(restored_path)
-        changed = sha256_file(locked_path) != original
-        repairs = sum(len(l.repairs) for l in result.manifest.layers)
-        touched = sum(l.slots_touched for l in result.manifest.layers)
-
-        print(f"features:   {', '.join(features)}")
-        print(f"slots kept:  {touched} scrambled")
-        print(f"repairs:     {repairs}")
-        print(f"ciphertext differs from plaintext: {'yes' if changed else 'NO (suspicious)'}")
-        print(f"round trip:  {'EXACT' if original == restored else 'MISMATCH'}")
-        return 0 if (original == restored and changed) else 1
+        if args.repeat > 1:
+            from collections import Counter
+            tally = Counter(verdicts)
+            print("features:   " + ", ".join(features))
+            print("result:     " + ", ".join(f"{k}={v}" for k, v in tally.most_common()))
+            if len(tally) > 1:
+                print("this carrier is NOT reliably lockable: the outcome depends "
+                      "on the nonce, so one passing run proves nothing")
+        return 0 if all(v == "EXACT" for v in verdicts) else 1
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
@@ -340,6 +398,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="store the seed in the manifest; manifest alone can unwind")
     p.add_argument("--no-selftest", action="store_true",
                    help="skip proving reversibility before writing the manifest")
+    p.add_argument("--allow-noop", action="store_true",
+                   help="permit a locked file that is byte-identical to the "
+                        "carrier (i.e. nothing was scrambled). Refused by default")
     p.add_argument("--recipient", action="append", metavar="PUBKEY",
                    help="public key or key file; repeat for several recipients. "
                         "Overrides passphrase and key-file modes.")
@@ -361,6 +422,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--mode", default="full", choices=list(MODES))
     p.add_argument("--intensity", type=float, default=1.0)
     p.add_argument("--key-file")
+    p.add_argument("--repeat", type=int, default=1, metavar="N",
+                   help="run the round trip N times with different nonces. Some "
+                        "carriers pass for most nonces and fail for a few, so "
+                        "one run is weak evidence")
+    p.add_argument("--random-nonce", action="store_true",
+                   help="draw nonces at random instead of deriving them from the "
+                        "run index (makes the result non-reproducible)")
     p.set_defaults(func=cmd_verify)
 
     return parser

@@ -43,6 +43,14 @@ group, ℤ↓N, where N is a power of two:
 | MPEG-1/2 video | `f_code + 4` | 32 | `[-16, 15]` |
 | MPEG-4 / H.263 | `f_code + 5` | 64 | `[-32, 31]` |
 
+In a B-frame the two directions have **different** f_codes: forward vectors are
+coded against `fcode`, backward ones against `bcode`, which FFedit reports as a
+separate field. On a `-bf 2` MPEG-2 encode, 27 of 32 B-frames had
+`bcode != fcode`. Using the forward code for both is wrong in both directions —
+too narrow and a legal file is refused, too wide and a value gets written that
+the codec cannot store. Measured: writing `17` into a slot whose true `bcode`
+is 1 read back as `-15`.
+
 Any bijection on ℤ↓N is losslessly reversible. glitchlock uses two, both keyed:
 
 - **Substitution** — add a keystream offset to each value, modulo its own domain.
@@ -237,14 +245,67 @@ digest to the input before it writes the manifest. If it does not match, **no
 manifest is written and the command fails**. A lock that cannot be proven
 reversible is not shipped.
 
+Reversibility is not the only thing worth proving, though. A byte-identical
+copy of the carrier unlocks to itself perfectly, so the self-test alone will
+wave it through. `lock` therefore also refuses to write output that is
+byte-identical to its input, because that output *is* the plaintext:
+
+```console
+$ glitchlock lock all-intra.m4v -o locked.m4v -m m.json --key-file key.bin
+glitchlock: the locked file is byte-identical to the carrier: nothing was
+actually scrambled, so this output is the plaintext. ...
+```
+
+Three ordinary things land here, and none of them used to say a word:
+
+- **an all-intra carrier** (`--gop 1`) has no motion vectors to scramble;
+- **a static shot with `--mode permute`** — every vector is `(0,0)`, and
+  permuting values that are all equal is the identity map. Measured on a
+  solid-grey clip: 29,550 slots reported scrambled, output identical;
+- **a very low `--intensity` on a small file** can select zero slots.
+
+Pass `--allow-noop` if you genuinely want a copy.
+
+## Known limitations
+
+- **Interlaced carriers do not work.** An interlaced MPEG-2 carrier
+  (`-flags +ilme+ildct`) fails with a geometry error on every nonce; an
+  interlaced MPEG-4 one fails on *some* nonces — measured 5 failures in 12.
+  Field pictures split motion vectors per field and the re-exported slot
+  layout does not match what was written. Deinterlace before `prepare`.
+- **`verify` results are per-nonce.** Because of the above, a single passing
+  run is weak evidence for a carrier *class*. `verify` now derives its nonce
+  from the run index so a result is reproducible, and `--repeat N` sweeps N of
+  them:
+
+  ```console
+  $ glitchlock verify interlaced.m4v --repeat 12
+  ...
+  result:     EXACT=7, FAILED=5
+  this carrier is NOT reliably lockable: the outcome depends on the nonce,
+  so one passing run proves nothing
+  ```
+
+- **FFglitch 0.10.2 aborts on some B-heavy MPEG-2 files.** `ffedit -f qscale`
+  on a `-bf 4` carrier dies with `free(): chunks in smallbin corrupted`
+  (exit 134) before glitchlock sees any data. It is an upstream crash, not a
+  glitchlock one, and it fails closed — but it means such files cannot be
+  locked with the `qscale` layer. `--features mv` still works on them.
+
 ## Status
 
-Verified on FFglitch 0.10.2, MPEG-2 and MPEG-4 part 2. 80 tests pass, including
-byte-exact round trips through real bitstreams for every mode, both codecs, and
-a chunked stream.
-Other codecs in the domain table (H.263, MSMPEG-4, WMV1/2, FLV1) share MPEG-4's
-motion vector geometry but have not been round-trip tested here; `verify` will
-tell you.
+Verified on FFglitch 0.10.2, MPEG-2 and MPEG-4 part 2. 117 tests pass,
+including byte-exact round trips through real bitstreams for every mode, both
+codecs, B-frames, 4MV, qpel and a chunked stream. Beyond the suite, a
+900-configuration sweep across 18 source clips (odd dimensions, 16x16, single
+frame, 60 fps, greyscale, pure noise, 720p) round-tripped byte-exact in every
+case that scrambled anything at all.
+
+**Only mpeg1video, mpeg2video and mpeg4 are actually lockable.** The domain
+table also lists H.263, MSMPEG-4 v1–v3, WMV1/2 and FLV1 because their motion
+vector geometry is known, but FFglitch 0.10.2 exposes no editable features for
+any of them — `ffedit -i` lists nothing, so there is nothing to scramble. They
+are kept in the table against a future FFglitch that does expose them.
 
 ## Is this encryption?
 

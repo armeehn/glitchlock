@@ -74,6 +74,13 @@ Domain = Tuple[int, int]
 DomainSlot = Tuple[Any, Any, Path, Domain]
 
 #: How many bits wider than f_code the decoder's sign extension is, per codec.
+#:
+#: Only ``mpeg1video``, ``mpeg2video`` and ``mpeg4`` are reachable in practice.
+#: FFglitch 0.10.2 exposes no editable features at all for the rest -- run
+#: ``ffedit -i`` on an H.263, MSMPEG-4, WMV or FLV1 file and it lists nothing
+#: under the stream, so there is no ``mv`` payload to scramble. The entries
+#: stay because the geometry is a fact about the codec and a later FFglitch
+#: may expose them; ``select_features`` reports the real reason per file.
 MV_WIDTH_SHIFT = {
     "mpeg1video": 4,
     "mpeg2video": 4,
@@ -133,10 +140,19 @@ def mv_width_shift(codec: str) -> int:
 
 def _mv_slots(frame_payload: Dict[str, Any], codec: str) -> Iterator[DomainSlot]:
     fcode: List[int] = frame_payload.get("fcode") or []
+    # Backward vectors in a B-frame are coded against their own f_code, which
+    # FFedit reports separately as "bcode". They are frequently different --
+    # measured on a -bf 2 mpeg2video encode, 27 of 32 B-frames had
+    # bcode != fcode. Using fcode for both directions is wrong in both
+    # directions: too narrow and the domain guard refuses a legal file, too
+    # wide and we write a value the codec cannot store (measured: 17 written
+    # into a bcode=1 slot came back as -15). P-frames carry no bcode, so fall
+    # back to fcode there.
+    bcode: List[int] = frame_payload.get("bcode") or fcode
     if not fcode:
         return
     shift = mv_width_shift(codec)
-    for direction in ("forward", "backward"):
+    for direction, codes in (("forward", fcode), ("backward", bcode)):
         grid = frame_payload.get(direction)
         if not grid:
             continue
@@ -145,7 +161,7 @@ def _mv_slots(frame_payload: Dict[str, Any], codec: str) -> Iterator[DomainSlot]
             # is the axis. MPEG-4 reports a single f_code for both axes;
             # MPEG-2 reports one per axis.
             axis = rel[-1] if isinstance(rel[-1], int) else 0
-            f = fcode[axis] if axis < len(fcode) else fcode[0]
+            f = codes[axis] if axis < len(codes) else codes[0]
             n = 1 << (f + shift)
             yield (container, key, (direction,) + rel, (-(n >> 1), n))
 

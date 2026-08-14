@@ -51,6 +51,15 @@ class GeometryError(LockError):
     """The ciphertext no longer has the same slot layout as the plaintext."""
 
 
+class NoOpLock(LockError):
+    """The lock produced a byte-identical copy of the carrier.
+
+    Reversibility is trivially satisfied by a copy, so the self-test cannot
+    catch this. It is nevertheless the worst outcome the tool has: the user
+    is handed the plaintext and told it is locked.
+    """
+
+
 @dataclass
 class LockResult:
     manifest: Manifest
@@ -187,6 +196,7 @@ def lock(
     selftest: bool = True,
     report: Reporter = _noop,
     segment: int = 0,
+    allow_noop: bool = False,
 ) -> LockResult:
     manifest = Manifest(
         ffglitch=ffg.version(),
@@ -222,6 +232,27 @@ def lock(
 
     manifest.locked_sha256 = sha256_file(out_path)
     manifest.locked_bytes = os.path.getsize(out_path)
+
+    if not allow_noop and manifest.locked_sha256 == manifest.carrier_sha256:
+        # The self-test below would pass this happily -- a copy unlocks to
+        # itself byte for byte -- so reversibility is the wrong question to
+        # ask here. The right one is whether anything was scrambled at all.
+        # Two ways to land here, both silent before this check:
+        #   * the carrier has no slots for the chosen features (an all-intra
+        #     MPEG-4 file has no motion vectors at all), and
+        #   * every value in a permutation bucket is identical, so shuffling
+        #     them is the identity map (constant-qscale --mode permute).
+        raise NoOpLock(
+            "the locked file is byte-identical to the carrier: nothing was "
+            "actually scrambled, so this output is the plaintext. "
+            f"{sum(l.slots_touched for l in manifest.layers)} slots were "
+            f"reported touched across features "
+            f"{', '.join(l.feature for l in manifest.layers) or 'none'}. "
+            "An all-intra carrier has no motion vectors to scramble, and "
+            "permuting values that are all equal is the identity. Re-encode "
+            "with a GOP longer than 1, choose different --features/--mode, or "
+            "pass --allow-noop if you really want a copy. No manifest written."
+        )
 
     selftest_ok: Optional[bool] = None
     if selftest:
