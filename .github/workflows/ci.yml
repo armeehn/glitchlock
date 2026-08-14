@@ -33,14 +33,40 @@ jobs:
           python-version: "3.11"
       - name: install FFglitch
         run: |
+          # The prebuilt FFglitch binaries link against SDL2 (ffplay is in the
+          # same bundle). Without it every binary dies with
+          #   ffedit: error while loading shared libraries: libSDL2-2.0.so.0
+          # and exits 127, which surfaces much later as dozens of confusing
+          # CalledProcessError(127) in the tests rather than as an install
+          # failure.
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libsdl2-2.0-0
           curl -sSL -o ffglitch.zip \
             https://ffglitch.org/pub/bin/linux64/ffglitch-0.10.2-linux-x86_64.zip
           unzip -q ffglitch.zip -d /opt
           mv /opt/ffglitch-0.10.2-linux-x86_64 /opt/ffglitch
           chmod +x /opt/ffglitch/*
           echo "/opt/ffglitch" >> "$GITHUB_PATH"
-      - run: ffedit -version | head -1
+      # No pipe here. `ffedit -version | head -1` reports head's exit status,
+      # so a completely non-functional ffedit passed this check silently and
+      # the job carried on to produce 40 mystery errors.
+      - name: smoke-check the FFglitch binaries
+        run: |
+          ffedit -version
+          ffgac -version
       - run: pip install -e ".[recipients]" pytest
-      - run: pytest -v
+      # Fail loudly if the bitstream tests silently skipped. This job exists to
+      # run them, and `ffg.available()` turns every one into a skip the moment
+      # the binaries are unusable -- so "all green, 40 skipped" is precisely the
+      # outcome this job must never report as success.
+      - name: run the full suite, and prove nothing skipped
+        run: |
+          set -o pipefail
+          pytest -v | tee pytest.log
+          if grep -qE '[0-9]+ skipped' pytest.log; then
+            echo "::error::tests skipped in the integration job -- FFglitch is \
+          not working, so the byte-exact round-trip proof did not actually run"
+            exit 1
+          fi
       - name: end-to-end demo
         run: bash examples/demo.sh "${RUNNER_TEMP}/demo"
