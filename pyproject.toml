@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "glitchlock"
+version = "1.0.0"
+description = "Reversible, keyed bitstream scrambling for video, built on FFglitch"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+keywords = ["ffglitch", "datamosh", "glitch", "video", "bitstream", "reversible"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Multimedia :: Video",
+    "Topic :: Artistic Software",
+]
+dependencies = []
+
+[project.scripts]
+glitchlock = "glitchlock.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/armeehn/glitchlock"
+Issues = "https://github.com/armeehn/glitchlock/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

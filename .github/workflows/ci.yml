@@ -1,0 +1,46 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  unit:
+    # Unit tests need no FFglitch and no video: they prove the transform is a
+    # bijection on synthetic FFedit-shaped payloads.
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.9", "3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: pip install -e . pytest
+      - run: pytest tests/test_transform.py tests/test_crypto.py -v
+
+  integration:
+    # The real proof: byte-exact round trips through actual MPEG-2 and MPEG-4
+    # bitstreams, using the FFglitch binaries.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: install FFglitch
+        run: |
+          curl -sSL -o ffglitch.zip \
+            https://ffglitch.org/pub/bin/linux64/ffglitch-0.10.2-linux-x86_64.zip
+          unzip -q ffglitch.zip -d /opt
+          mv /opt/ffglitch-0.10.2-linux-x86_64 /opt/ffglitch
+          chmod +x /opt/ffglitch/*
+          echo "/opt/ffglitch" >> "$GITHUB_PATH"
+      - run: ffedit -version | head -1
+      - run: pip install -e . pytest
+      - run: pytest -v
+      - name: end-to-end demo
+        run: bash examples/demo.sh "${RUNNER_TEMP}/demo"
