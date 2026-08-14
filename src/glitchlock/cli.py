@@ -121,7 +121,8 @@ def cmd_inspect(args) -> int:
 
 def cmd_prepare(args) -> int:
     ffg.transcode(
-        args.input, args.output, codec=args.codec, qscale=args.qscale, gop=args.gop
+        args.input, args.output, codec=args.codec, qscale=args.qscale,
+        gop=args.gop, closed_gop=args.closed_gop,
     )
     feats = lockable_features(args.output)
     print(f"carrier: {args.output}")
@@ -152,6 +153,7 @@ def cmd_lock(args) -> int:
         intensity=args.intensity,
         selftest=not args.no_selftest,
         report=_report,
+        segment=args.segment,
     )
     manifest = result.manifest
     manifest.kdf = kdf
@@ -256,6 +258,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--codec", default="mpeg2video", choices=["mpeg2video", "mpeg4"])
     p.add_argument("--qscale", type=int, default=6)
     p.add_argument("--gop", type=int, default=25)
+    p.add_argument("--closed-gop", action="store_true",
+                   help="self-contained GOPs, so the carrier can be split into "
+                        "independently lockable stream segments")
     p.set_defaults(func=cmd_prepare)
 
     def add_key_args(sp):
@@ -270,6 +275,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--mode", default="full", choices=list(MODES))
     p.add_argument("--intensity", type=float, default=1.0,
                    help="fraction of slots to scramble, 0 < i <= 1 (default 1.0)")
+    p.add_argument("--segment", type=int, default=0,
+                   help="streaming segment number; give each piece of a chunked "
+                        "stream its own so they do not share a keystream")
     p.add_argument("--keyless", action="store_true",
                    help="store the seed in the manifest; manifest alone can unwind")
     p.add_argument("--no-selftest", action="store_true",

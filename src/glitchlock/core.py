@@ -124,6 +124,7 @@ def _run_layer(
     forward: bool,
     workdir: str,
     repairs: Optional[Dict[str, int]] = None,
+    segment: int = 0,
 ) -> Layer:
     """Transform one feature from *src* into *dst*, returning layer statistics."""
     exported = os.path.join(workdir, f"{feature}.export.json")
@@ -133,7 +134,8 @@ def _run_layer(
     before = collect_values(doc, feature)
 
     stats = transform_document(
-        doc, feature, key, nonce, mode=mode, intensity=intensity, forward=forward
+        doc, feature, key, nonce, mode=mode, intensity=intensity,
+        forward=forward, segment=segment,
     )
 
     if not forward and repairs:
@@ -184,11 +186,13 @@ def lock(
     intensity: float = 1.0,
     selftest: bool = True,
     report: Reporter = _noop,
+    segment: int = 0,
 ) -> LockResult:
     manifest = Manifest(
         ffglitch=ffg.version(),
         codec=ffg.codec_name(carrier),
         nonce=nonce.hex(),
+        segment=segment,
         carrier_sha256=sha256_file(carrier),
         carrier_bytes=os.path.getsize(carrier),
     )
@@ -204,7 +208,7 @@ def lock(
             report(f"  locking layer {index + 1}/{len(features)}: {feature}")
             layer = _run_layer(
                 current, dst, feature, key, nonce, mode, intensity,
-                forward=True, workdir=layer_dir,
+                forward=True, workdir=layer_dir, segment=segment,
             )
             report(
                 f"    {layer.slots_touched}/{layer.slots_total} slots across "
@@ -277,6 +281,7 @@ def unlock(
             _run_layer(
                 current, dst, layer.feature, key, nonce, layer.mode, layer.intensity,
                 forward=False, workdir=layer_dir, repairs=layer.repairs,
+                segment=manifest.segment,
             )
             current = dst
     finally:

@@ -142,6 +142,30 @@ $ glitchlock verify carrier.mpg
 round trip:  EXACT
 ```
 
+## Streaming
+
+Yes, it works on a stream, at GOP granularity, and the round trip stays
+byte-exact. Encode with closed GOPs, split on sequence headers, and give every
+segment its own number:
+
+```console
+$ glitchlock prepare live.mkv -o carrier.mpg --gop 12 --closed-gop
+$ glitchlock lock seg_0007.mpg -o locked_0007.mpg -m /dev/null --segment 7 --key-file key.bin
+```
+
+The segment number matters more than it looks: without it, every segment's frame
+0 derives an identical plan from the same key and nonce, and the whole broadcast
+shares one keystream. The round trip still works, which is what makes it
+dangerous.
+
+The receiver finds segment boundaries by scanning the locked stream itself, and
+can synthesise its manifest from session parameters — so nothing has to be sent
+alongside the video. Latency is one GOP (480 ms at GOP 12/25 fps). 720p keeps up
+with a live feed on 4 cores; 1080p needs more.
+
+See [STREAMING.md](STREAMING.md) for the measurements and for what is still
+missing — there is no TS/HLS wrapping, no audio path and no daemon yet.
+
 ## The manifest
 
 The manifest is the record of how the file was scrambled. It is small — 1,085
@@ -183,8 +207,9 @@ reversible is not shipped.
 
 ## Status
 
-Verified on FFglitch 0.10.2, MPEG-2 and MPEG-4 part 2. 59 tests pass, including
-byte-exact round trips through real bitstreams for every mode and both codecs.
+Verified on FFglitch 0.10.2, MPEG-2 and MPEG-4 part 2. 80 tests pass, including
+byte-exact round trips through real bitstreams for every mode, both codecs, and
+a chunked stream.
 Other codecs in the domain table (H.263, MSMPEG-4, WMV1/2, FLV1) share MPEG-4's
 motion vector geometry but have not been round-trip tested here; `verify` will
 tell you.

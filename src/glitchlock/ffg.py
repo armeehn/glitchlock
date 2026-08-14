@@ -136,12 +136,17 @@ def transcode(
     qscale: int = 6,
     gop: int = 25,
     extra: Optional[List[str]] = None,
+    closed_gop: bool = False,
 ) -> None:
     """Produce a glitchable carrier elementary stream with ffgac.
 
     ``+nopimb+forcemv`` is the standard FFglitch encoding recipe: it stops the
     encoder from emitting "skip" macroblocks, so every macroblock carries a
     real motion vector and there is something to scramble everywhere.
+
+    ``closed_gop`` makes every GOP self-contained and pins the GOP length, which
+    is what lets a stream be cut into independently lockable segments. See
+    :mod:`glitchlock.stream`.
     """
     cmd = [
         ffgac_path(), "-v", "error", "-y", "-i", src, "-an",
@@ -151,6 +156,10 @@ def transcode(
         "-vcodec", codec,
         "-f", "rawvideo",
     ]
+    if closed_gop:
+        # +cgop makes GOPs independently decodable; disabling scene-cut
+        # detection keeps them a fixed length so segment size is predictable.
+        cmd += ["-flags", "+cgop", "-sc_threshold", "1000000000"]
     if extra:
         cmd += extra
     cmd.append(dst)

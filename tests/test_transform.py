@@ -159,6 +159,52 @@ def test_mixed_fcode_axes_use_separate_domains():
     assert y_domains == {(-256, 512)}
 
 
+def test_segments_do_not_share_a_keystream():
+    """Chunked streaming: piece N and piece M must not produce the same plan.
+
+    Without this, every chunk's frame 0 derives an identical plan from the same
+    key and nonce, which is keystream reuse across the whole stream.
+    """
+    a = make_mv_doc()
+    b = copy.deepcopy(a)
+    transform_document(a, "mv", KEY, NONCE, forward=True, segment=1)
+    transform_document(b, "mv", KEY, NONCE, forward=True, segment=2)
+    assert a != b
+
+    zero = make_mv_doc()
+    transform_document(zero, "mv", KEY, NONCE, forward=True, segment=0)
+    assert zero != a, "segment 0 must differ from segment 1"
+
+
+@pytest.mark.parametrize("segment", [0, 1, 7, 99999])
+def test_segment_roundtrip(segment):
+    original = make_mv_doc()
+    doc = copy.deepcopy(original)
+    transform_document(doc, "mv", KEY, NONCE, forward=True, segment=segment)
+    assert doc != original
+    transform_document(doc, "mv", KEY, NONCE, forward=False, segment=segment)
+    assert doc == original
+
+
+def test_wrong_segment_does_not_restore():
+    original = make_mv_doc()
+    doc = copy.deepcopy(original)
+    transform_document(doc, "mv", KEY, NONCE, forward=True, segment=3)
+    transform_document(doc, "mv", KEY, NONCE, forward=False, segment=4)
+    assert doc != original
+
+
+def test_segment_zero_is_the_legacy_label():
+    """Segment 0 must not change behaviour for ordinary single-file locks."""
+    from glitchlock.transform import _label
+
+    assert _label("mv", 0, 6, "plan", 0) == b"mv|0|6|plan"
+    assert _label("mv", 0, 6, "plan", 2) == b"mv|2|0|6|plan"
+    # the two forms differ in field count, so they can never collide
+    assert len(_label("mv", 9, 9, "plan", 0).split(b"|")) == 4
+    assert len(_label("mv", 9, 9, "plan", 1).split(b"|")) == 5
+
+
 def test_wrong_key_does_not_restore():
     original = make_mv_doc()
     doc = copy.deepcopy(original)

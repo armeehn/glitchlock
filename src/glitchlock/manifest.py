@@ -46,6 +46,10 @@ class Manifest:
     ffglitch: str = ""
     codec: str = ""
     nonce: str = ""
+    #: Streaming segment number. Zero for an ordinary single-file lock. When a
+    #: stream is cut into independently locked pieces, each piece needs its own
+    #: number so the pieces do not share a keystream.
+    segment: int = 0
     keyless: bool = False
     #: present only when keyless: the seed the key was derived from
     seed: Optional[str] = None

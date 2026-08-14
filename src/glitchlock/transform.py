@@ -63,7 +63,23 @@ def iter_frames(
             yield si, fi, codec, frame.get(feature)
 
 
-def _label(feature: str, stream_idx: int, frame_idx: int, part: str) -> bytes:
+def _label(
+    feature: str, stream_idx: int, frame_idx: int, part: str, segment: int = 0
+) -> bytes:
+    """Domain-separation label for one frame's keystream.
+
+    ``segment`` exists for streaming. When a long stream is cut into
+    independently processed pieces, each piece's frame numbering restarts at
+    zero, so frame 0 of every piece would derive the *same* plan from the same
+    key and nonce -- classic keystream reuse. Passing a distinct segment number
+    per piece separates them.
+
+    Segment 0 keeps the original four-field label, so non-streaming use is
+    unchanged. Segment > 0 inserts a fifth field. The two forms can never
+    collide because they differ in field count.
+    """
+    if segment:
+        return f"{feature}|{segment}|{stream_idx}|{frame_idx}|{part}".encode("utf-8")
     return f"{feature}|{stream_idx}|{frame_idx}|{part}".encode("utf-8")
 
 
@@ -76,13 +92,14 @@ def plan_frame(
     frame_idx: int,
     mode: str,
     intensity: float,
+    segment: int = 0,
 ) -> FramePlan:
     """Build the keyed, data-independent plan for one frame."""
     plan = FramePlan()
     if not slots:
         return plan
 
-    ks = KeyStream(key, nonce, _label(feature, stream_idx, frame_idx, "plan"))
+    ks = KeyStream(key, nonce, _label(feature, stream_idx, frame_idx, "plan", segment))
 
     # 1. Selection. intensity == 1.0 short-circuits so the common case does not
     #    burn keystream on a decision whose answer is always yes.
@@ -167,6 +184,7 @@ def transform_document(
     mode: str = "full",
     intensity: float = 1.0,
     forward: bool = True,
+    segment: int = 0,
 ) -> LayerStats:
     """Lock or unlock one FFedit feature document in place."""
     if mode not in MODES:
@@ -188,7 +206,7 @@ def transform_document(
         stats.frames += 1
         stats.slots_total += len(slots)
         plan = plan_frame(
-            slots, key, nonce, feature, stream_idx, frame_idx, mode, intensity
+            slots, key, nonce, feature, stream_idx, frame_idx, mode, intensity, segment
         )
         stats.buckets += len(plan.buckets)
         stats.slots_touched += apply_plan(slots, plan, forward)
