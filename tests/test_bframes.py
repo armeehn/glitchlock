@@ -172,6 +172,20 @@ def test_all_intra_mpeg4_lock_is_refused(carrier_all_intra, tmp_path):
         lock(carrier_all_intra, locked, key=KEY, nonce=NONCE, features=features)
 
 
+def test_refused_lock_leaves_no_output_file(carrier_all_intra, tmp_path):
+    """A refused lock must not leave a plaintext file at the output path.
+
+    The layers run before the no-op check, so the output already exists by the
+    time we refuse. Leaving it puts plaintext exactly where the user asked for
+    ciphertext, under the name they chose for it.
+    """
+    locked = str(tmp_path / "locked.bin")
+    features = select_features(carrier_all_intra, None)
+    with pytest.raises(NoOpLock):
+        lock(carrier_all_intra, locked, key=KEY, nonce=NONCE, features=features)
+    assert not os.path.exists(locked), "refused lock left its output behind"
+
+
 def test_all_intra_noop_can_be_forced(carrier_all_intra, tmp_path):
     """--allow-noop is the escape hatch, and it really does produce a copy."""
     locked = str(tmp_path / "locked.bin")
