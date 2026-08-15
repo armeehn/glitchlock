@@ -1,0 +1,5 @@
+# ripdoc build scratch — DOC NO. RL-BRAND-001-MD.
+# pdf/ is the deliverable and IS committed; everything below is regenerated.
+tex/
+.ripdocs-cache.json
+.ripdocs-lock
