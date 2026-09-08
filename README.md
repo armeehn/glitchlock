@@ -82,7 +82,7 @@ many bits it occupies, which shifts everything after it. Measured directly: afte
 writing scrambled DC values and re-exporting, the *block structure itself* came
 back different — the decoder reported `ac-tex damaged`, `invalid cbp` and
 `slice mismatch`. There is no manifest that can undo that, so the feature is not
-offered. See [DESIGN.md](DESIGN.md) for the full evidence.
+offered. See [docs/pdf/design.pdf](docs/pdf/design.pdf) for the full evidence.
 
 ## Install
 
@@ -180,7 +180,7 @@ core scrambler stays dependency-free.
 **This solves key distribution, not information leakage.** The locked video is
 still a playable video whose residual picture survives. Public keys make it
 practical to hand a locked file to someone; they do not make the ciphertext
-safe to publish. [SECURITY.md](SECURITY.md) is explicit about this.
+safe to publish. [docs/pdf/security.pdf](docs/pdf/security.pdf) is explicit about this.
 
 ## Streaming
 
@@ -203,7 +203,7 @@ can synthesise its manifest from session parameters — so nothing has to be sen
 alongside the video. Latency is one GOP (480 ms at GOP 12/25 fps). 720p keeps up
 with a live feed on 4 cores; 1080p needs more.
 
-See [STREAMING.md](STREAMING.md) for the measurements and for what is still
+See [docs/pdf/streaming.pdf](docs/pdf/streaming.pdf) for the measurements and for what is still
 missing — there is no TS/HLS wrapping, no audio path and no daemon yet.
 
 ## The manifest
@@ -311,7 +311,7 @@ are kept in the table against a future FFglitch that does expose them.
 
 It is a keyed, reversible cipher, and the key really is required. It is **not**
 a replacement for encrypting a file, and you should read
-[SECURITY.md](SECURITY.md) before treating it as one. The short version: the
+[docs/pdf/security.pdf](docs/pdf/security.pdf) before treating it as one. The short version: the
 ciphertext is a video, and a video that still decodes leaks information about
 itself. Use it for reversible glitch art, for obfuscation, for watermarking
 experiments — not for protecting a secret. If you want confidentiality, use age
