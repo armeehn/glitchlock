@@ -1,0 +1,227 @@
+% DOC NO. RL-370-DESIGN · REV. A
+%
+% This file IS the document. Edit it directly - ripdoc compiles it
+% as it stands and stamps the provenance line at build time.
+%
+%   ripdoc build --only design
+%
+% Promoted from DESIGN.md on 2026-09-07 by `ripdoc promote`.
+\documentclass[fontpath=fonts/,logopath=logo/]{riposte-doc}
+\usepackage{riposte-md}
+
+\title{Design}
+\author{Riposte Laboratories}
+\date{}
+\ripdocno{RL-370-DESIGN}
+\riprev{A}
+\ripstrapline{How glitchlock works, why each choice was made, and the measurements behind them. Everything in the "Evidence" section was run against FFglitch 0.10.2 on x86-64 Linux and is reproducible with \NoCaseChange{\ripmono{glitchlock verify}}.}
+\riprunningtitle{Design}
+
+\begin{document}
+
+\ripmakehead
+
+\riptoc
+
+
+\ripsection{\ripmdhead{1. The problem}}
+
+Datamoshing corrupts a compressed bitstream to produce visual artefacts. It is destructive by nature: the interesting glitches come precisely from feeding the decoder values the encoder never intended, and there is no general way back.
+
+We want the same visual result from an operation that is a \textbf{bijection}, with a small sidecar recording the parameters.
+
+Three things have to be true:
+
+\begin{ripnumbers}
+\item Every value we write must be one the codec can store and return \textbf{exactly}.
+\item The transform must be invertible given a key.
+\item The \riphi{set of editable positions} must be identical before and after, or the inverse has nowhere to put the values back.
+\end{ripnumbers}
+
+Point 3 is the one that quietly kills most candidate features.
+
+
+\ripsection{\ripmdhead{2. Plaintext is the carrier, not your source file}}
+
+\ripmono{glitchlock prepare} transcodes arbitrary input into an MPEG-2 or MPEG-4 elementary stream. That step is an ordinary lossy transcode and it drops audio.
+
+Everything downstream is bit-exact, and the carrier is what the manifest's \ripmono{carrier\_\allowbreak{}sha256} commits to. This boundary is deliberate and stated plainly rather than blurred: glitchlock does not claim to give you back your original H.264 file, because it cannot.
+
+
+\ripsection{\ripmdhead{3. Slots and domains}}
+
+A \textbf{slot} is one mutable scalar integer in an FFedit feature payload. A \textbf{domain} is the finite set of values that slot may hold, written \ripmono{(lo, n)} meaning \ripmono{lo .. lo+n-1}.
+
+Slots are enumerated in a canonical order (lists by index, dicts by sorted key, \ripmono{null} cells skipped because a null means "this block is not coded" and writing there would change the bitstream structure). Both directions of the transform walk the same order, so slot \riphi{i} on the way out is slot \riphi{i} on the way back.
+
+
+\ripsubsection{\ripmdhead{3.1 Motion vectors}}
+
+In both MPEG-2 and MPEG-4 the motion vector is reconstructed as \ripmono{predictor + delta} and then sign-extended to a fixed width tied to the frame's \ripmono{f\_code}. FFmpeg does this with \ripmono{sign\_\allowbreak{}extend(val,\allowbreak{} W + f\_\allowbreak{}code)}. The consequence is the whole basis of this tool: \textbf{out-of-range writes wrap, they do not clamp.} A wrapping field is a cyclic group, and modular arithmetic on it is exactly invertible.
+
+\ripmono{W} differs by codec, and this is the single most dangerous detail in the project:
+
+\begin{ripmdtable}{X[1.77,l]X[0.55,l]X[0.78,l]X[1.24,l]}
+\ripmdth{CODEC} & \ripmdth{\ripmono{W}} & \ripmdth{N AT F\_CODE=1} & \ripmdth{DOMAIN} \\
+MPEG-1/2 video & 4 & 32 & \ripmono{[-16, 15]} \\
+MPEG-4 / H.263 family & 5 & 64 & \ripmono{[-32, 31]} \\
+\end{ripmdtable}
+
+An MPEG-4 stream legitimately contains the vector \ripmono{17} at \ripmono{f\_code=1}. Assume the MPEG-2 width and that becomes \ripmono{-15}, silently, permanently. This was not a theoretical concern — it was a real bug caught by the integration suite during development, and it is now covered by a named regression test.
+
+\ripmono{f\_code} is per frame. On MPEG-2 it is also per axis, so x and y in the same \ripmono{[x, y]} pair can have different domains. The \ripmono{f\_code} values themselves are never modified.
+
+
+\ripsubsection{\ripmdhead{3.2 Quantiser scale}}
+
+MPEG-2 \ripmono{q\_scale\_code} is a fixed-width 5-bit field with legal values \ripmono{1..31}, so the domain is \ripmono{(1, 31)}. Because the field width is fixed, changing the value cannot shift anything downstream.
+
+
+\ripsubsection{\ripmdhead{3.3 What was rejected}}
+
+DCT coefficients (\ripmono{q\_dc}, \ripmono{q\_dct}, and their delta variants) are variable-length coded. Changing a value changes its bit length, which moves every subsequent bit in the slice. Measured, not assumed — see Evidence below.
+
+\ripmono{mv\_delta} is rejected for a subtler reason: the delta's legal range depends on the predictor, which depends on neighbouring vectors, so there is no fixed per-slot domain to be modular over.
+
+\ripmono{mb} (macroblock types) is rejected because the type determines how the \riphi{following} data is parsed — change it and the payload you were going to edit no longer means the same thing.
+
+
+\ripsection{\ripmdhead{4. The transform}}
+
+Two keyed layers per frame, both bijections on the slot domains.
+
+\textbf{Substitution.} Each selected slot gets its own keystream offset:
+
+\ripcodeopen
+\ripcodesize{9.0}{13.95}
+\begin{ripcodeblock}
+lock:    v' = lo + ((v  - lo) + k) mod n
+unlock:  v  = lo + ((v' - lo) - k) mod n
+\end{ripcodeblock}
+\ripcodesizereset\ripcodeclose
+
+\textbf{Permutation.} Selected slots are bucketed by \riphi{identical domain} and shuffled within their bucket by a keyed Fisher-Yates. The bucketing is load-bearing: moving a value from an \ripmono{f\_code=5} frame into an \ripmono{f\_code=1} slot would push it outside the smaller domain, and the codec would wrap it. Values only move between slots that can represent them.
+
+Order is substitute → permute when locking, inverse-permute → inverse-substitute when unlocking.
+
+
+\ripsubsection{\ripmdhead{4.1 The plan is data-independent}}
+
+All keystream is consumed to build a \ripmono{FramePlan} — selection mask, offsets, bucket permutations — \riphi{before} any value is read. The plan therefore depends only on \ripmono{(key,\allowbreak{} nonce,\allowbreak{} mode,\allowbreak{} intensity,\allowbreak{} slot geometry)}.
+
+This matters because unlock has to rebuild the identical plan while holding only the ciphertext. Slot geometry is invariant by construction (we never change \ripmono{f\_code}, never fill a null, never alter a macroblock type), so the ciphertext yields the same geometry and hence the same plan.
+
+
+\ripsubsection{\ripmdhead{4.2 Keystream}}
+
+HMAC-SHA256 in counter mode, domain-separated per \ripmono{feature | stream | frame | part}. Integers are drawn by rejection sampling, so there is no modulo bias — a biased sampler would still be reversible but would leak structure.
+
+\ripmono{intensity < 1} selects a key-derived subset of slots. Since the selection comes from the keystream and not from the data, unlock reproduces it exactly. Partial intensity weakens the \riphi{visual} scrambling, never the reversibility.
+
+
+\ripsection{\ripmdhead{5. Verification, not optimism}}
+
+Two independent checks, because a scheme that is reversible in theory and broken in practice is worse than one that admits it.
+
+\textbf{Per-layer diff.} After applying a layer, glitchlock re-exports the feature from its own output and compares it against what it intended to write. Any slot that disagrees is recorded in the manifest's \ripmono{repairs} map as the \riphi{original plaintext value}. Unlock applies those after inverting, so recovery is exact even if a codec edge case bites. If the slot \riphi{count} differs — meaning the geometry moved — that is unrecoverable and the lock aborts.
+
+On \ripmono{mv} and \ripmono{qscale}, \ripmono{repairs} is empty. The test suite asserts that rather than trusting it.
+
+\textbf{End-to-end self-test.} \ripmono{lock} then unlocks its own output into a temp directory and compares SHA-256 against the input carrier. On failure it raises and \textbf{writes no manifest}. You cannot end up holding a locked file plus a manifest that does not actually unlock it.
+
+
+\ripsection{\ripmdhead{6. Evidence}}
+
+Measurements from FFglitch 0.10.2, MPEG-2 320×240 and 640×480 test clips.
+
+
+\ripsubsection{\ripmdhead{Identity apply is byte-exact}}
+
+Exporting a feature and applying it back unchanged reproduces the input file byte for byte, on both codecs. This is the floor the whole design stands on: if it were false, no amount of correct arithmetic would give back the original bytes.
+
+\ripcodeopen
+\ripcodesize{9.0}{13.95}
+\begin{ripcodeblock}
+carrier_mpeg2.mpg  3d1528bf...  ->  null_apply.mpg  3d1528bf...   identical
+carrier_mpeg4.mp4  7f832b2f...  ->  mp4_null.mp4    7f832b2f...   identical
+\end{ripcodeblock}
+\ripcodesizereset\ripcodeclose
+
+
+\ripsubsection{\ripmdhead{Motion vectors wrap, they do not clamp}}
+
+Writing probe values around the boundary at \ripmono{f\_code=1} and reading them back:
+
+\begin{ripmdtable}{X[0.55,l]X[0.89,l]X[1.34,l]X[0.89,l]X[1.34,l]}
+\ripmdth{WROTE} & \ripmdth{MPEG-2 GOT} & \ripmdth{MOD-32 PREDICTS} & \ripmdth{MPEG-4 GOT} & \ripmdth{MOD-64 PREDICTS} \\
+-33 & -1 & -1 & 31 & 31 \\
+-17 & 15 & 15 & -17 & -17 \\
+-16 & -16 & -16 & -16 & -16 \\
+15 & 15 & 15 & 15 & 15 \\
+16 & -16 & -16 & 16 & 16 \\
+31 & -1 & -1 & 31 & 31 \\
+32 & 0 & 0 & -32 & -32 \\
+47 & 15 & 15 & -17 & -17 \\
+\end{ripmdtable}
+
+Every probe matches the modular prediction for its codec's width, and only for its codec's width. MPEG-2 fits size 32 and not 64; MPEG-4 fits 64 and not 32.
+
+
+\ripsubsection{\ripmdhead{Full-domain randomisation survives exactly}}
+
+\begin{ripmdtable}{X[1.13,l]X[1.13,l]X[0.74,l]}
+\ripmdth{CARRIER} & \ripmdth{SLOTS RANDOMISED ACROSS FULL DOMAIN} & \ripmdth{MISMATCHES ON RE-EXPORT} \\
+MPEG-2, f\_code 1 & 28,800 & 0 \\
+MPEG-2, f\_codes 1–5 mixed & 14,400 & 0 \\
+MPEG-4, f\_code 1 & 57,600 & 0 \\
+MPEG-2 \ripmono{qscale} & 1,500 & 0 \\
+\end{ripmdtable}
+
+
+\ripsubsection{\ripmdhead{DCT coefficients do not survive}}
+
+The same experiment on \ripmono{q\_dc} desynchronises the bitstream. The decoder emits \ripmono{ac-\allowbreak{}tex damaged}, \ripmono{invalid cbp}, \ripmono{slice mismatch} and \ripmono{mb incr damaged}, and — fatally — the re-exported payload has a \riphi{different number of slots} than the one written:
+
+\ripcodeopen
+\ripcodesize{9.0}{13.95}
+\begin{ripcodeblock}
+STRUCTURE CHANGED 254 -> 223
+STRUCTURE CHANGED 279 -> 228
+STRUCTURE CHANGED 230 -> 212
+...94 of 100 frames affected
+\end{ripcodeblock}
+\ripcodesizereset\ripcodeclose
+
+There is no manifest that repairs a structural change, so the feature is refused rather than offered with a warning.
+
+
+\ripsubsection{\ripmdhead{End to end}}
+
+10 s, 640×480, MPEG-2 carrier, \ripmono{mv} + \ripmono{qscale}, full mode:
+
+\begin{ripmdgrid}{X[0.87,l]X[1.13,l]}
+slots scrambled & 583,500 \\
+lock (including self-test) & 7.9 s \\
+unlock & 3.4 s \\
+carrier & 3,263,287 bytes \\
+locked & 3,790,607 bytes (+16\%) \\
+restored & 3,263,287 bytes, SHA-256 identical \\
+manifest & 1,085 bytes \\
+repairs recorded & 0 \\
+\end{ripmdgrid}
+
+The locked file grows because scrambled vectors are less predictable and cost more bits to code. This is expected and harmless.
+
+
+\ripsection{\ripmdhead{7. Known limits}}
+
+\begin{ripbullets}
+\item \ripmono{prepare} is lossy and drops audio; the carrier is the plaintext.
+\item Only MPEG-2 and MPEG-4 part 2 are round-trip tested. Other codecs in the domain table share MPEG-4's geometry but are untested here — \ripmono{verify} will tell you before you trust one.
+\item The locked file is larger than the carrier.
+\item Reversibility is tied to FFglitch's behaviour. A future release that changes MV export semantics would be caught by the self-test, which is exactly why the self-test runs by default.
+\end{ripbullets}
+
+\ripend
+
+\end{document}

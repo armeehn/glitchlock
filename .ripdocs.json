@@ -14,7 +14,7 @@
   "documents": [
     {
       "id": "design",
-      "source": "DESIGN.md",
+      "source": "DESIGN.tex",
       "docno": "RL-370-DESIGN",
       "rev": "A",
       "class": "riposte-doc"
@@ -28,14 +28,14 @@
     },
     {
       "id": "security",
-      "source": "SECURITY.md",
+      "source": "SECURITY.tex",
       "docno": "RL-370-SECURITY",
       "rev": "A",
       "class": "riposte-doc"
     },
     {
       "id": "streaming",
-      "source": "STREAMING.md",
+      "source": "STREAMING.tex",
       "docno": "RL-370-STREAMING",
       "rev": "A",
       "class": "riposte-doc"
