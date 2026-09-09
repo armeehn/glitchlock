@@ -1,0 +1,34 @@
+[Unit]
+Description=Glitchlock web front end (reversible video bitstream scrambler)
+Documentation=https://github.com/armeehn/glitchlock
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=glitchlock
+Group=glitchlock
+WorkingDirectory=/opt/glitchlock
+Environment=GLITCHLOCK_PORT=8087
+Environment=GLITCHLOCK_MAX_UPLOAD=67108864
+Environment=GLITCHLOCK_RETENTION=3600
+Environment=PATH=/opt/ffglitch:/usr/local/bin:/usr/bin:/bin
+ExecStart=/opt/glitchlock-venv/bin/python /opt/glitchlock/server.py
+Restart=on-failure
+RestartSec=3
+
+# It only ever needs its own job store.
+StateDirectory=glitchlock
+ReadWritePaths=/var/lib/glitchlock
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryMax=2400M
+
+[Install]
+WantedBy=multi-user.target

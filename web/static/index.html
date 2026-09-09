@@ -1,0 +1,648 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Glitchlock — hq.ripostelabs.xyz</title>
+<link rel="stylesheet" href="/riposte-brand.css">
+<style>
+  .row{display:flex;flex-wrap:wrap;gap:14px;align-items:flex-end}
+  .field{display:flex;flex-direction:column;gap:6px}
+  .field label{font-size:var(--text-label);letter-spacing:var(--tracking-label);
+    text-transform:uppercase;opacity:.75}
+  input[type=text],input[type=password],input[type=number],select,textarea{
+    font-family:var(--font-mono);font-size:13px;padding:9px 11px;
+    border:var(--rule);background:var(--surface);color:var(--text);border-radius:0}
+  input[type=text],input[type=password]{width:340px;max-width:80vw}
+  textarea{width:100%;min-height:96px;resize:vertical}
+  .drop{border:2px dashed var(--line);background:var(--surface-sunken);
+    padding:26px 20px;text-align:center;cursor:pointer;transition:all var(--dur-snap)}
+  .drop:hover,.drop.over{border-color:var(--teal);background:var(--surface)}
+  .drop b{display:block;font-size:15px;margin-bottom:4px}
+  .drop span{font-size:13px;opacity:.7}
+  .steps{display:grid;gap:18px}
+  .stepbox{border:var(--rule);background:var(--surface);padding:16px}
+  .stepbox>h3{margin:0 0 12px;font-size:var(--text-label);
+    letter-spacing:var(--tracking-spec);text-transform:uppercase;
+    display:flex;gap:10px;align-items:center}
+  .stepbox>h3 .n{background:var(--label-fill);color:var(--label-ink);
+    padding:3px 8px;font-weight:700}
+  .stepbox[data-done="1"]>h3 .n{background:var(--teal);color:var(--on-teal)}
+  .tabs{display:flex;gap:0;margin-bottom:14px;flex-wrap:wrap}
+  .tabs button{border:var(--rule);background:var(--surface);padding:8px 14px;
+    font-family:var(--font-mono);font-size:12px;letter-spacing:.08em;
+    text-transform:uppercase;cursor:pointer;margin-right:-2px}
+  .tabs button[aria-selected=true]{background:var(--text);color:var(--bg)}
+  button.go{font-family:var(--font-mono);padding:13px 26px;border:2px solid var(--line);
+    background:transparent;color:var(--text);text-transform:uppercase;font-weight:700;
+    letter-spacing:.12em;font-size:13px;cursor:pointer;transition:all var(--dur-snap)}
+  button.go:hover:not(:disabled){background:var(--text);color:var(--bg);
+    transform:translate(-2px,-2px);box-shadow:var(--shadow-pop-teal)}
+  button.go:disabled{opacity:.4;cursor:not-allowed}
+  .mono{font-family:var(--font-mono)}
+  .hash{font-family:var(--font-mono);font-size:11.5px;word-break:break-all;
+    background:var(--surface-sunken);border:var(--rule);padding:8px 10px}
+  .hash i{font-style:normal;display:block;font-size:9.5px;letter-spacing:.12em;
+    text-transform:uppercase;opacity:.6;margin-bottom:3px}
+  .vids{display:grid;gap:14px;grid-template-columns:repeat(auto-fit,minmax(240px,1fr))}
+  .vid{border:var(--rule);background:var(--surface)}
+  .vid video{width:100%;display:block;background:#000;aspect-ratio:4/3;object-fit:contain}
+  .vid .cap{padding:8px 10px;font-size:12px;display:flex;justify-content:space-between;
+    align-items:center;gap:8px}
+  .out{margin-top:18px;display:none}
+  .out.on{display:block}
+  .msg{font-family:var(--font-mono);font-size:12.5px;padding:10px 12px;
+    border:var(--rule);border-left:var(--bar-left) solid var(--orange);
+    background:var(--surface-sunken);display:none}
+  .msg.on{display:block}
+  .msg.bad{border-left-color:var(--pink)}
+  .msg.busy{border-left-color:var(--teal)}
+  .dls{display:flex;gap:12px;flex-wrap:wrap;margin-top:14px}
+  pre.j{margin:0;padding:12px;background:var(--surface-sunken);border:var(--rule);
+    font-family:var(--font-mono);font-size:11px;line-height:1.5;
+    max-height:280px;overflow:auto}
+  .grid-2{display:grid;gap:var(--space-6)}
+  @media(min-width:860px){.grid-2{grid-template-columns:1fr 1fr}}
+  .keyout{display:none}
+  .keyout.on{display:block}
+  footer.colophon{border-top:2px solid var(--ink);margin-top:64px;padding:22px 0;
+    font-size:12px;opacity:.75}
+</style>
+</head>
+<body>
+
+<header class="pagehead">
+  <div class="inner">
+    <div class="kicker">Riposte Laboratories &middot; internal tooling</div>
+    <h1>Glitchlock</h1>
+    <p>Scramble a video under a key and unwind it later, byte for byte, from a
+    manifest. Built on FFglitch. Everything here runs on this box — nothing leaves
+    the LAN.</p>
+    <div class="pills" style="margin-top:16px">
+      <span class="chip teal">Reversible</span>
+      <span class="chip ink">MPEG-2 / MPEG-4</span>
+      <span class="chip orange">Not confidentiality</span>
+      <span class="pill" id="ffgv">ffglitch &hellip;</span>
+    </div>
+  </div>
+</header>
+
+<div class="wrap">
+
+  <!-- ============================ LOCK ============================ -->
+  <section class="section">
+    <div class="sechead tealno">
+      <span class="no">01</span>
+      <h2>Lock</h2>
+      <span class="tag">upload &rarr; carrier &rarr; locked + manifest</span>
+    </div>
+
+    <div class="steps">
+      <div class="stepbox" id="s1">
+        <h3><span class="n">1</span> Choose a video</h3>
+        <div class="drop" id="drop">
+          <b>Drop a video here, or click to choose</b>
+          <span>Anything ffmpeg reads. 64 MB limit — use the CLI for bigger jobs.</span>
+        </div>
+        <input type="file" id="file" accept="video/*" hidden>
+        <div class="row" style="margin-top:12px">
+          <button class="go" id="useSample">Use a sample clip instead</button>
+          <div class="mono" id="fileInfo" style="font-size:12.5px;opacity:.75"></div>
+        </div>
+      </div>
+
+      <div class="stepbox" id="s2">
+        <h3><span class="n">2</span> Build a glitchable carrier</h3>
+        <p style="font-size:13.5px;opacity:.8;margin:0 0 12px;max-width:70ch">
+          H.264 and HEVC expose nothing reversible, so the file is transcoded to an
+          MPEG-2 elementary stream first. This step is lossy and drops audio —
+          <b>the carrier is what gets restored exactly</b>, not your original.
+        </p>
+        <div class="row">
+          <div class="field">
+            <label for="codec">Codec</label>
+            <select id="codec">
+              <option value="mpeg2video">mpeg2video (mv + qscale)</option>
+              <option value="mpeg4">mpeg4 (mv only)</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="qscale">Quality (qscale)</label>
+            <input type="number" id="qscale" value="6" min="2" max="20">
+          </div>
+          <div class="field">
+            <label for="gop">GOP</label>
+            <input type="number" id="gop" value="25" min="2" max="300">
+          </div>
+          <div class="field">
+            <label for="cgop">Closed GOP</label>
+            <select id="cgop">
+              <option value="0">no</option>
+              <option value="1">yes (splittable for streaming)</option>
+            </select>
+          </div>
+          <button class="go" id="doPrepare" disabled>Prepare</button>
+        </div>
+        <div class="msg" id="prepMsg"></div>
+        <div id="prepOut" class="out"></div>
+      </div>
+
+      <div class="stepbox" id="s3">
+        <h3><span class="n">3</span> Key</h3>
+        <div class="tabs" role="tablist">
+          <button role="tab" aria-selected="true" data-key="passphrase">Passphrase</button>
+          <button role="tab" aria-selected="false" data-key="recipient">Public key</button>
+        </div>
+        <div id="keyPassphrase">
+          <div class="field">
+            <label for="pass">Passphrase (scrypt, N=2^15)</label>
+            <input type="password" id="pass" autocomplete="new-password"
+                   placeholder="you will need this exact string to unlock">
+          </div>
+        </div>
+        <div id="keyRecipient" hidden>
+          <div class="field">
+            <label for="recips">Recipient public keys — one per line</label>
+            <textarea id="recips" spellcheck="false"
+              placeholder="glk-pub-v1:..."></textarea>
+          </div>
+          <p style="font-size:12.5px;opacity:.75;margin:8px 0 0">
+            Locks a random content key to each recipient with X25519. Only a matching
+            private identity can unlock. Generate one in section 03.</p>
+        </div>
+      </div>
+
+      <div class="stepbox" id="s4">
+        <h3><span class="n">4</span> Scramble</h3>
+        <div class="row">
+          <div class="field">
+            <label for="mode">Mode</label>
+            <select id="mode">
+              <option value="full">full — substitute + permute</option>
+              <option value="permute">permute — keeps the value histogram</option>
+              <option value="substitute">substitute — local chaos</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="intensity">Intensity</label>
+            <input type="number" id="intensity" value="1" min="0.01" max="1" step="0.01">
+          </div>
+          <div class="field">
+            <label for="segment">Segment (streaming)</label>
+            <input type="number" id="segment" value="0" min="0" max="999999">
+          </div>
+          <button class="go" id="doLock" disabled>Lock</button>
+        </div>
+        <div class="msg" id="lockMsg"></div>
+        <div id="lockOut" class="out"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- =========================== UNLOCK =========================== -->
+  <section class="section">
+    <div class="sechead">
+      <span class="no">02</span>
+      <h2>Unlock</h2>
+      <span class="tag">locked + manifest + key &rarr; the carrier, exactly</span>
+    </div>
+
+    <div class="grid-2">
+      <div class="stepbox">
+        <h3><span class="n">A</span> The locked file</h3>
+        <div class="drop" id="dropU">
+          <b>Drop locked.mpg here</b>
+          <span>or click to choose</span>
+        </div>
+        <input type="file" id="fileU" hidden>
+        <div class="mono" id="fileInfoU" style="font-size:12.5px;opacity:.75;margin-top:10px"></div>
+
+        <h3 style="margin-top:20px"><span class="n">B</span> Its manifest</h3>
+        <div class="drop" id="dropM">
+          <b>Drop manifest.json here</b>
+          <span>or paste it below</span>
+        </div>
+        <input type="file" id="fileM" accept=".json,application/json" hidden>
+        <div class="field" style="margin-top:10px">
+          <label for="manText">Manifest JSON</label>
+          <textarea id="manText" spellcheck="false" placeholder='{"format":"glitchlock-manifest",...}'></textarea>
+        </div>
+      </div>
+
+      <div class="stepbox">
+        <h3><span class="n">C</span> Key</h3>
+        <div class="tabs" role="tablist">
+          <button role="tab" aria-selected="true" data-ukey="passphrase">Passphrase</button>
+          <button role="tab" aria-selected="false" data-ukey="identity">Private identity</button>
+        </div>
+        <div id="ukeyPassphrase">
+          <div class="field">
+            <label for="passU">Passphrase</label>
+            <input type="password" id="passU" autocomplete="off">
+          </div>
+        </div>
+        <div id="ukeyIdentity" hidden>
+          <div class="field">
+            <label for="identity">Private identity</label>
+            <textarea id="identity" spellcheck="false" placeholder="glk-sec-v1:..."></textarea>
+          </div>
+        </div>
+        <div class="row" style="margin-top:16px">
+          <button class="go" id="doUnlock" disabled>Unlock</button>
+        </div>
+        <div class="msg" id="unlockMsg"></div>
+        <div id="unlockOut" class="out"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================ KEYS ============================ -->
+  <section class="section">
+    <div class="sechead orangeno">
+      <span class="no">03</span>
+      <h2>Identities</h2>
+      <span class="tag">X25519 keypair for recipient mode</span>
+    </div>
+    <div class="grid-2">
+      <div class="stepbox">
+        <h3><span class="n">&#9673;</span> Generate a keypair</h3>
+        <button class="go" id="doKeygen">Generate</button>
+        <div class="keyout" id="keyOut" style="margin-top:16px"></div>
+      </div>
+      <div class="note">
+        <b>This keypair is generated on the server</b>
+        The private half is returned to your browser once and never written to disk
+        here, but it did travel over the LAN and passed through this box's memory. For
+        anything that matters, run <span class="mono">glitchlock keygen</span> on your
+        own machine instead and paste only the public half into section 01.
+      </div>
+    </div>
+  </section>
+
+  <!-- =========================== ABOUT ============================= -->
+  <section class="section">
+    <div class="sechead pinkno">
+      <span class="no">04</span>
+      <h2>What this is, and is not</h2>
+      <span class="tag">read before trusting it</span>
+    </div>
+    <div class="grid-2">
+      <div class="verdict yes">
+        <div class="v-h">What it guarantees</div>
+        <ul>
+          <li>The restored file is byte-identical to the carrier — verified by SHA-256, not by eye.</li>
+          <li>Locking self-tests by unlocking its own output before it hands you a manifest.</li>
+          <li>The key is required. A wrong key or an edited manifest is refused, not silently mangled.</li>
+          <li>Nothing leaves this machine. Uploads are deleted after an hour.</li>
+        </ul>
+      </div>
+      <div class="verdict no">
+        <div class="v-h">What it does not do</div>
+        <ul>
+          <li>It is not confidentiality. The locked file is a playable video and its residual picture survives.</li>
+          <li>The transcode in step 2 is lossy and drops audio. The carrier is the plaintext, not your original.</li>
+          <li>No sender authentication — anyone with your public key can lock a file to you.</li>
+          <li>For real secrecy, encrypt the file with age or GPG instead.</li>
+        </ul>
+      </div>
+    </div>
+    <div class="row" style="margin-top:24px">
+      <a class="cta" href="/bench">Open the proof bench</a>
+      <a class="cta" href="https://apps.hq.ripostelabs.xyz/">Back to apps</a>
+    </div>
+  </section>
+
+  <footer class="colophon">
+    glitchlock 1.0.0 &middot; FFglitch 0.10.2 &middot; source
+    <span class="mono">github.com/armeehn/glitchlock</span> &middot;
+    served from <span class="mono">10.0.1.183</span>, gated by Authelia.
+  </footer>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+const state = {src:null, carrier:null, locked:null, lockedUpload:null, manifest:null,
+               keyMode:"passphrase", ukeyMode:"passphrase"};
+
+function msg(el, text, kind){
+  const n = $(el);
+  n.className = "msg on" + (kind ? " " + kind : "");
+  n.textContent = text;
+}
+function clearMsg(el){ $(el).className = "msg"; }
+const fmt = n => n.toLocaleString("en-US");
+const mb = n => (n/1048576).toFixed(2) + " MB";
+
+/* Read a response, and when it is not JSON say what it actually was. A bare
+   "server returned junk" tells nobody anything: the useful facts are the status
+   code and the first line of whatever came back, which is usually a proxy error
+   page or an auth redirect. */
+async function readJSON(r, what){
+  const text = await r.text();
+  let j = null;
+  try{ j = JSON.parse(text); }catch(e){}
+  if(j === null){
+    const ct = r.headers.get("content-type") || "unknown type";
+    const snippet = text.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim().slice(0, 160);
+    const hint = /sign in|authelia|login/i.test(text)
+      ? " — your session looks expired; reload the page and sign in again."
+      : "";
+    throw new Error(`${what} returned HTTP ${r.status} as ${ct}, not JSON${hint}` +
+                    (snippet ? ` [${snippet}]` : ""));
+  }
+  if(!r.ok) throw new Error(j.error || (what + " failed: HTTP " + r.status));
+  return j;
+}
+
+async function api(path, payload){
+  let r;
+  try{
+    r = await fetch(path, {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify(payload || {})
+    });
+  }catch(e){
+    throw new Error(path + " could not be reached: " + e.message);
+  }
+  return readJSON(r, path);
+}
+const MAX_UPLOAD = 64 * 1048576;
+async function upload(file){
+  // Stop an over-sized file here rather than pushing 200 MB up the wire only to
+  // be told no at the far end.
+  if(file.size > MAX_UPLOAD){
+    throw new Error("that file is " + (file.size/1048576).toFixed(0) +
+      " MB and the limit here is 64 MB. Use the command line for bigger jobs.");
+  }
+  let r;
+  try{
+    r = await fetch("/api/upload", {
+      method:"POST", headers:{"X-Filename": file.name}, body:file});
+  }catch(e){
+    throw new Error("the upload could not be sent: " + e.message);
+  }
+  return readJSON(r, "upload");
+}
+
+/* ---------- file pickers ---------- */
+function wireDrop(dropSel, inputSel, onFile){
+  const d = $(dropSel), i = $(inputSel);
+  d.addEventListener("click", () => i.click());
+  d.addEventListener("dragover", e => { e.preventDefault(); d.classList.add("over"); });
+  d.addEventListener("dragleave", () => d.classList.remove("over"));
+  d.addEventListener("drop", e => {
+    e.preventDefault(); d.classList.remove("over");
+    if(e.dataTransfer.files[0]) onFile(e.dataTransfer.files[0]);
+  });
+  i.addEventListener("change", () => { if(i.files[0]) onFile(i.files[0]); });
+}
+
+wireDrop("#drop", "#file", async f => {
+  try{
+    msg("#prepMsg", "uploading " + f.name + " (" + mb(f.size) + ")…", "busy");
+    state.src = await upload(f);
+    $("#fileInfo").textContent = state.src.name + " · " + mb(state.src.bytes);
+    $("#s1").dataset.done = "1";
+    $("#doPrepare").disabled = false;
+    clearMsg("#prepMsg");
+  }catch(e){ msg("#prepMsg", e.message, "bad"); }
+});
+
+$("#useSample").addEventListener("click", async () => {
+  try{
+    msg("#prepMsg", "building a sample clip on the server…", "busy");
+    state.src = await api("/api/sample");
+    $("#fileInfo").textContent = state.src.name + " · " + mb(state.src.bytes) + " (generated)";
+    $("#s1").dataset.done = "1";
+    $("#doPrepare").disabled = false;
+    clearMsg("#prepMsg");
+  }catch(e){ msg("#prepMsg", e.message, "bad"); }
+});
+
+/* ---------- prepare ---------- */
+$("#doPrepare").addEventListener("click", async () => {
+  if(!state.src) return;
+  const btn = $("#doPrepare"); btn.disabled = true;
+  msg("#prepMsg", "transcoding to a glitchable carrier…", "busy");
+  try{
+    const r = await api("/api/prepare", {
+      id: state.src.id, name: state.src.name,
+      codec: $("#codec").value,
+      qscale: +$("#qscale").value, gop: +$("#gop").value,
+      closed_gop: $("#cgop").value === "1"
+    });
+    state.carrier = r;
+    $("#s2").dataset.done = "1";
+    $("#doLock").disabled = false;
+    clearMsg("#prepMsg");
+    $("#prepOut").className = "out on";
+    $("#prepOut").innerHTML =
+      `<div class="row" style="gap:20px;align-items:stretch">
+         <div class="stat" style="flex:1;min-width:150px"><div class="n teal">${r.codec}</div>
+           <div class="l">carrier codec</div></div>
+         <div class="stat" style="flex:1;min-width:150px"><div class="n">${mb(r.bytes)}</div>
+           <div class="l">carrier size</div></div>
+         <div class="stat" style="flex:1;min-width:150px"><div class="n orange">${r.lockable.join(" + ")}</div>
+           <div class="l">reversible features found</div></div>
+       </div>
+       <div class="hash" style="margin-top:12px"><i>carrier sha-256 — this is what must come back</i>${r.sha256}</div>`;
+  }catch(e){ msg("#prepMsg", e.message, "bad"); }
+  btn.disabled = false;
+});
+
+/* ---------- key tabs ---------- */
+document.querySelectorAll("[data-key]").forEach(b => b.addEventListener("click", () => {
+  document.querySelectorAll("[data-key]").forEach(x =>
+    x.setAttribute("aria-selected", String(x === b)));
+  state.keyMode = b.dataset.key;
+  $("#keyPassphrase").hidden = state.keyMode !== "passphrase";
+  $("#keyRecipient").hidden = state.keyMode !== "recipient";
+}));
+document.querySelectorAll("[data-ukey]").forEach(b => b.addEventListener("click", () => {
+  document.querySelectorAll("[data-ukey]").forEach(x =>
+    x.setAttribute("aria-selected", String(x === b)));
+  state.ukeyMode = b.dataset.ukey;
+  $("#ukeyPassphrase").hidden = state.ukeyMode !== "passphrase";
+  $("#ukeyIdentity").hidden = state.ukeyMode !== "identity";
+}));
+
+function lockKeySpec(){
+  if(state.keyMode === "recipient"){
+    const list = $("#recips").value.split("\n").map(s => s.trim()).filter(Boolean);
+    if(!list.length) throw new Error("add at least one recipient public key");
+    return {type:"recipient", recipients:list};
+  }
+  const p = $("#pass").value;
+  if(!p) throw new Error("a passphrase is required");
+  return {type:"passphrase", passphrase:p};
+}
+
+/* ---------- lock ---------- */
+$("#doLock").addEventListener("click", async () => {
+  if(!state.carrier) return;
+  const btn = $("#doLock"); btn.disabled = true;
+  try{
+    const key = lockKeySpec();
+    msg("#lockMsg", "locking, then unlocking its own output to prove it reverses…", "busy");
+    const r = await api("/api/lock", {
+      id: state.carrier.id, name: state.carrier.name,
+      mode: $("#mode").value, intensity: +$("#intensity").value,
+      segment: +$("#segment").value, key
+    });
+    state.locked = r;
+    $("#s4").dataset.done = "1";
+    clearMsg("#lockMsg");
+
+    const pass = r.selftest === "pass";
+    const mURL = URL.createObjectURL(
+      new Blob([JSON.stringify(r.manifest, null, 2)], {type:"application/json"}));
+
+    $("#lockOut").className = "out on";
+    $("#lockOut").innerHTML =
+      `<div class="verdict ${pass ? "yes" : "no"}">
+         <div class="v-h">${pass ? "Self-test passed — this file provably reverses" : "Self-test failed"}</div>
+         <ul>
+           <li>${fmt(r.slots)} values scrambled across ${r.features.join(" + ")}</li>
+           <li>${r.repairs} repairs needed</li>
+           <li>locked file is ${r.growth}&times; the carrier</li>
+         </ul>
+       </div>
+       <div class="vids" style="margin-top:16px">
+         <div class="vid"><video controls muted loop playsinline
+              src="/preview/${r.id}/${state.carrier.name}"></video>
+           <div class="cap"><span>Carrier</span><span class="chip teal">plaintext</span></div></div>
+         <div class="vid"><video controls muted loop playsinline autoplay
+              src="/preview/${r.id}/${r.locked.name}"></video>
+           <div class="cap"><span>Locked</span><span class="chip orange">ciphertext</span></div></div>
+       </div>
+       <div class="row" style="margin-top:14px;gap:12px">
+         <div class="hash" style="flex:1;min-width:260px"><i>carrier sha-256</i>${r.carrier.sha256}</div>
+         <div class="hash" style="flex:1;min-width:260px"><i>locked sha-256</i>${r.locked.sha256}</div>
+       </div>
+       <div class="dls">
+         <a class="cta" href="/d/${r.id}/${r.locked.name}" download>Download locked.mpg</a>
+         <a class="cta" href="${mURL}" download="manifest.json">Download manifest.json</a>
+         <button class="go" id="handoff">Send both to Unlock</button>
+       </div>
+       <details style="margin-top:16px"><summary class="mono" style="cursor:pointer;font-size:12px">
+         Show the manifest</summary>
+         <pre class="j">${JSON.stringify(r.manifest, null, 2)
+            .replace(/&/g,"&amp;").replace(/</g,"&lt;")}</pre></details>`;
+
+    $("#handoff").addEventListener("click", () => {
+      state.lockedUpload = {id:r.id, name:r.locked.name};
+      $("#fileInfoU").textContent = r.locked.name + " · " + mb(r.locked.bytes) + " (from section 01)";
+      $("#manText").value = JSON.stringify(r.manifest, null, 2);
+      $("#doUnlock").disabled = false;
+      document.querySelector("#doUnlock").scrollIntoView({behavior:"smooth", block:"center"});
+    });
+  }catch(e){ msg("#lockMsg", e.message, "bad"); }
+  btn.disabled = false;
+});
+
+/* ---------- unlock ---------- */
+wireDrop("#dropU", "#fileU", async f => {
+  try{
+    msg("#unlockMsg", "uploading " + f.name + "…", "busy");
+    const j = await upload(f);
+    state.lockedUpload = {id:j.id, name:j.name};
+    $("#fileInfoU").textContent = j.name + " · " + mb(j.bytes);
+    $("#doUnlock").disabled = false;
+    clearMsg("#unlockMsg");
+  }catch(e){ msg("#unlockMsg", e.message, "bad"); }
+});
+wireDrop("#dropM", "#fileM", f => {
+  const fr = new FileReader();
+  fr.onload = () => { $("#manText").value = fr.result; };
+  fr.readAsText(f);
+});
+
+$("#doUnlock").addEventListener("click", async () => {
+  const btn = $("#doUnlock"); btn.disabled = true;
+  try{
+    if(!state.lockedUpload) throw new Error("choose the locked file first");
+    let manifest;
+    try{ manifest = JSON.parse($("#manText").value); }
+    catch(e){ throw new Error("the manifest is not valid JSON"); }
+
+    let key;
+    if(state.ukeyMode === "identity"){
+      const id = $("#identity").value.trim();
+      if(!id) throw new Error("paste your private identity");
+      key = {type:"identity", identity:id};
+    }else{
+      const p = $("#passU").value;
+      if(!p) throw new Error("a passphrase is required");
+      key = {type:"passphrase", passphrase:p};
+    }
+
+    msg("#unlockMsg", "unlocking…", "busy");
+    const r = await api("/api/unlock", {
+      id: state.lockedUpload.id, name: state.lockedUpload.name, manifest, key});
+    clearMsg("#unlockMsg");
+    $("#unlockOut").className = "out on";
+    $("#unlockOut").innerHTML =
+      `<div class="verdict ${r.exact ? "yes" : "warn"}">
+         <div class="v-h">${r.exact ? "Byte-exact — the carrier is back"
+                                    : "Restored, but the digest does not match"}</div>
+         <ul>
+           <li>restored ${mb(r.bytes)}</li>
+           <li>sha-256 ${r.exact ? "matches the manifest" : "differs from the manifest"}</li>
+         </ul>
+       </div>
+       <div class="row" style="margin-top:12px;gap:12px">
+         <div class="hash" style="flex:1;min-width:260px"><i>expected</i>${r.expected || "—"}</div>
+         <div class="hash" style="flex:1;min-width:260px"><i>got</i>${r.sha256}</div>
+       </div>
+       <div class="vids" style="margin-top:14px">
+         <div class="vid"><video controls muted loop playsinline
+              src="/preview/${r.id}/${r.name}"></video>
+           <div class="cap"><span>Restored</span><span class="chip teal">recovered</span></div></div>
+       </div>
+       <div class="dls"><a class="cta" href="/d/${r.id}/${r.name}" download>Download restored.mpg</a></div>`;
+  }catch(e){ msg("#unlockMsg", e.message, "bad"); }
+  btn.disabled = false;
+});
+
+/* ---------- keygen ---------- */
+$("#doKeygen").addEventListener("click", async () => {
+  const btn = $("#doKeygen"); btn.disabled = true;
+  try{
+    const k = await api("/api/keygen");
+    const box = $("#keyOut");
+    box.className = "keyout on";
+    box.innerHTML =
+      `<div class="hash"><i>public key — share this</i>${k.public}</div>
+       <div class="hash" style="margin-top:10px;border-left:var(--bar-left) solid var(--pink)">
+         <i>private identity — keep this, it is shown once</i>${k.secret}</div>
+       <div class="hash" style="margin-top:10px"><i>fingerprint</i>${k.fingerprint}</div>
+       <div class="row" style="margin-top:12px">
+         <button class="go" id="useRecip">Use as recipient in section 01</button>
+         <button class="go" id="useIdent">Use as identity in section 02</button>
+       </div>`;
+    $("#useRecip").addEventListener("click", () => {
+      document.querySelector('[data-key="recipient"]').click();
+      const t = $("#recips");
+      t.value = (t.value.trim() ? t.value.trim() + "\n" : "") + k.public;
+      t.scrollIntoView({behavior:"smooth", block:"center"});
+    });
+    $("#useIdent").addEventListener("click", () => {
+      document.querySelector('[data-ukey="identity"]').click();
+      $("#identity").value = k.secret;
+    });
+  }catch(e){
+    $("#keyOut").className = "keyout on";
+    $("#keyOut").innerHTML = `<div class="msg on bad">${e.message}</div>`;
+  }
+  btn.disabled = false;
+});
+
+/* ---------- banner ---------- */
+fetch("/health").then(r => r.json()).then(j => {
+  const v = (j.ffglitch || "").match(/ffglitch-[\d.]+/);
+  $("#ffgv").textContent = v ? v[0] : "ffglitch";
+}).catch(() => {});
+</script>
+</body>
+</html>
