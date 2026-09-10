@@ -22,6 +22,8 @@ ciphertext, whose slot geometry is unchanged by construction.
 
 from __future__ import annotations
 
+import hashlib
+from array import array
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterator, List, Tuple
 
@@ -213,18 +215,64 @@ def transform_document(
     return stats
 
 
-def collect_values(doc: Dict[str, Any], feature: str) -> Dict[str, int]:
-    """Snapshot every slot value keyed by a stable address string.
-
-    Used to diff an intended payload against what the encoder actually wrote,
-    so any discrepancy can be recorded in the manifest as a repair.
-    """
-    out: Dict[str, int] = {}
+def iter_addressed(doc: Dict[str, Any], feature: str) -> Iterator[Tuple[Any, Any, str]]:
+    """Yield ``(container, key, address)`` for every slot, in canonical order."""
     for stream_idx, frame_idx, codec, payload in iter_frames(doc, feature):
         for container, key, path, _domain in frame_slots(feature, payload, codec):
             address = f"{stream_idx}/{frame_idx}/" + "/".join(str(p) for p in path)
-            out[address] = container[key]
-    return out
+            yield container, key, address
+
+
+def collect_values(doc: Dict[str, Any], feature: str) -> Dict[str, int]:
+    """Snapshot every slot value keyed by a stable address string.
+
+    Convenient for tests and small documents. For anything real use
+    :func:`snapshot`: a 4K carrier has 20 million slots, and an address
+    string per slot costs more heap than the document itself.
+    """
+    return {address: container[key] for container, key, address in iter_addressed(doc, feature)}
+
+
+@dataclass
+class Snapshot:
+    """Every slot value in canonical order, plus a digest of the address
+    sequence. Four bytes per slot instead of a string-keyed dict entry, so
+    two documents can be compared without holding either one's addresses.
+    """
+    values: array
+    layout: bytes
+
+    def same_layout(self, other: "Snapshot") -> bool:
+        return self.layout == other.layout
+
+
+def snapshot(doc: Dict[str, Any], feature: str) -> Snapshot:
+    values = array("i")
+    digest = hashlib.sha256()
+    for container, key, address in iter_addressed(doc, feature):
+        values.append(container[key])
+        digest.update(address.encode("utf-8"))
+        digest.update(b"\0")
+    return Snapshot(values, digest.digest())
+
+
+def find_repairs(
+    doc: Dict[str, Any], feature: str, intended: Snapshot, before: Snapshot
+) -> Dict[str, int]:
+    """Addresses where *doc* differs from *intended*, mapped to the value
+    *before* held there. The caller has already checked the layouts match.
+
+    The cheap array compare runs first: repairs are empirically empty, so
+    the address walk almost never happens.
+    """
+    actual = snapshot(doc, feature)
+    if actual.values == intended.values:
+        return {}
+    return {
+        address: before.values[i]
+        for i, (_container, _key, address) in enumerate(iter_addressed(doc, feature))
+        if actual.values[i] != intended.values[i]
+    }
 
 
 def apply_repairs(doc: Dict[str, Any], feature: str, repairs: Dict[str, int]) -> int:
