@@ -32,7 +32,8 @@ from .domains import CODEC_FEATURES, REJECTED_FEATURES, SUPPORTED_FEATURES
 from .manifest import Layer, Manifest
 from .transform import (
     apply_repairs,
-    collect_values,
+    find_repairs,
+    snapshot,
     transform_document,
 )
 
@@ -155,7 +156,7 @@ def _run_layer(
     modified = os.path.join(workdir, f"{feature}.modified.json")
 
     doc = ffg.export(src, feature, exported)
-    before = collect_values(doc, feature)
+    before = snapshot(doc, feature)
 
     stats = transform_document(
         doc, feature, key, nonce, mode=mode, intensity=intensity,
@@ -165,8 +166,12 @@ def _run_layer(
     if not forward and repairs:
         apply_repairs(doc, feature, repairs)
 
-    intended = collect_values(doc, feature)
+    intended = snapshot(doc, feature)
     ffg.write_json(doc, modified)
+    # The document is the largest thing in memory (about 15 bytes of heap per
+    # byte of JSON, 1.3 GB for a 4K carrier). Drop it before the verify pass
+    # below loads a second one, or the peak is two documents at once.
+    del doc
     ffg.apply(src, feature, modified, dst)
 
     layer = Layer(
@@ -184,18 +189,14 @@ def _run_layer(
         # reproduce, so unlock can repair it from the manifest.
         verify_json = os.path.join(workdir, f"{feature}.verify.json")
         actual_doc = ffg.export(dst, feature, verify_json)
-        actual = collect_values(actual_doc, feature)
-        if set(actual) != set(intended):
+        actual = snapshot(actual_doc, feature)
+        if not actual.same_layout(intended):
             raise GeometryError(
                 f"feature {feature!r}: the locked file has a different slot layout "
-                f"({len(actual)} slots vs {len(intended)}). This codec/feature "
-                "combination is not reversible."
+                f"({len(actual.values)} slots vs {len(intended.values)}). This "
+                "codec/feature combination is not reversible."
             )
-        layer.repairs = {
-            address: before[address]
-            for address, value in intended.items()
-            if actual[address] != value
-        }
+        layer.repairs = find_repairs(actual_doc, feature, intended, before)
 
     return layer
 
