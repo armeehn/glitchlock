@@ -1,6 +1,7 @@
 # glitchlock
 
-Reversible, keyed bitstream scrambling for video, built on [FFglitch](https://ffglitch.org).
+Reversible, keyed bitstream scrambling for video, built on [FFglitch](https://ffglitch.org),
+and for MP2 audio, in pure Python.
 
 You take a video, scramble its guts with a key, and get back a file that still
 plays — as a mess. Later, with the key and the manifest, you get the original
@@ -229,7 +230,59 @@ most twice `--workers` are in flight, so memory stays bounded. A stream that
 ends inside a GOP fails on its last piece only; everything before it is out.
 
 See [docs/pdf/streaming.pdf](docs/pdf/streaming.pdf) for the measurements and for what is still
-missing — there is no TS/HLS wrapping, no audio path and no daemon yet.
+missing — there is no TS/HLS wrapping and no daemon yet.
+
+## Audio
+
+MPEG-1/2 Audio Layer II (MP2) elementary streams lock the same way, with the
+same manifest, MAC, self-test and no-op refusal. No FFglitch involved: the
+frame parser and writer are pure Python (`glitchlock/mp2.py`).
+
+```console
+$ ffmpeg -i song.flac -c:a mp2 -b:a 192k song.mp2
+$ glitchlock inspect song.mp2
+codec:    mp2 (MPEG-1 Audio Layer II)
+stream:   48000 Hz, stereo, 192 kbps, 8843 frames (212.2 s)
+lockable features: samples, scalefactors
+$ glitchlock lock song.mp2 -o locked.mp2 -m m.json --key-file key.bin
+$ glitchlock unlock locked.mp2 -o back.mp2 -m m.json --key-file key.bin
+integrity: OK - byte-exact match with the original carrier
+```
+
+Why MP2 and not MP3 or AAC: Layer II has no entropy coding. After the header,
+bit allocation and scfsi, a frame is nothing but fixed-width fields — 6-bit
+scalefactor indices and quantised subband samples whose width the allocation
+dictates (3, 5 and 9 levels pack three samples into one 5-, 7- or 10-bit
+codeword). Every such field gets `(v + k) mod range`, `k` from the keystream,
+with `range` the field's *legal* set: `nlevels` for a plain sample,
+`nlevels**3` for a grouped codeword, 63 for a scalefactor (index 63 is
+reserved). XOR would be wrong here, because it can produce a value outside
+that set. The result parses in every decoder, decodes with the right number of
+samples, sounds like shaped noise (measured |r| < 0.03 against the original
+across the fixture matrix) and inverts exactly. `--mode permute` shuffles field
+values within a frame between fields of the same range; `full` does both.
+
+Header, CRC, bit allocation and scfsi are never touched: they define the
+geometry. That is also why a protected stream keeps a valid CRC-16 — per
+ISO/IEC 11172-3 2.4.3.1 (and ffmpeg's `handle_crc`) it covers only header
+bytes 2-3, the allocation and the scfsi bits, verified with
+`ffmpeg -err_detect crccheck` on locked frames.
+
+Per-frame keying includes `--segment` exactly as for video, so a stream cut
+into pieces can be locked piecewise and reassembled. `mp2.FrameReader` /
+`mp2.iter_mp2_frames` frame a live stream incrementally for a receiver that
+unlocks frame by frame. Framing accepts every valid header as a frame with no
+"does the next header chain" check, on purpose: a rule that peeked into frame
+bodies could decide differently on the ciphertext. Junk between frames (ID3
+tags, garbage) passes through verbatim.
+
+Supported: MPEG-1 (32/44.1/48 kHz) and MPEG-2 LSF (16/22.05/24 kHz), mono,
+stereo, dual channel and joint stereo (intensity `bound` honoured), all five
+allocation tables, with or without CRC. Not supported: Layer I, Layer III,
+AAC, free-format bitrate, and MP2 muxed inside a container (demux to an
+elementary stream first). Detection sniffs the sync word and two chained
+headers, not the extension. Throughput is about 300 frames/s on one core for
+192 kbps stereo, roughly 7x real time.
 
 ## The manifest
 
@@ -319,9 +372,10 @@ Pass `--allow-noop` if you genuinely want a copy.
 
 ## Status
 
-Verified on FFglitch 0.10.2, MPEG-2 and MPEG-4 part 2. 117 tests pass,
-including byte-exact round trips through real bitstreams for every mode, both
-codecs, B-frames, 4MV, qpel and a chunked stream. Beyond the suite, a
+Verified on FFglitch 0.10.2, MPEG-2 and MPEG-4 part 2, and on MP2 audio
+against ffmpeg 8.1. 247 tests pass, including byte-exact round trips through
+real bitstreams for every mode, both video codecs, B-frames, 4MV, qpel, a
+chunked stream, and 20 MP2 fixtures across rates, bitrates, modes and CRC. Beyond the suite, a
 900-configuration sweep across 18 source clips (odd dimensions, 16x16, single
 frame, 60 fps, greyscale, pure noise, 720p) round-tripped byte-exact in every
 case that scrambled anything at all.
