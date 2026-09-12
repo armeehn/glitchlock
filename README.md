@@ -101,13 +101,24 @@ If FFglitch lives somewhere unusual, point at it with
 
 ### prepare — make a lockable carrier
 
-Most video is H.264/HEVC, which exposes nothing reversible. `prepare` transcodes
+Stock FFglitch exposes nothing reversible for H.264/HEVC. `prepare` transcodes
 to a glitchable MPEG-2 or MPEG-4 elementary stream using the standard FFglitch
-encoder recipe (`+nopimb+forcemv`, so every macroblock carries a real vector).
+encoder recipe (`+nopimb+forcemv`, so every macroblock carries a real vector),
+or to H.264 when the patched `ffedit` from [ffglitch/](ffglitch/) is on PATH.
 
 ```console
 $ glitchlock prepare input.mkv -o carrier.mpg --codec mpeg2video --qscale 6 --gop 25
+$ glitchlock prepare input.mkv -o carrier.264 --codec h264 --gop 25 --closed-gop
 ```
+
+The H.264 carrier is Main profile with CAVLC entropy coding and two B-frames,
+made by the system `ffmpeg`'s libx264 (`--qscale` does not apply; it uses
+CRF 23). CAVLC matters: motion vector differences are plain Exp-Golomb codes
+there, so an edited vector never changes the shape of the bitstream. CABAC
+streams are refused, not corrupted. Scrambled vectors stay within ±512 px,
+the Level 3.1 vertical range, so hardware decoders still play the result.
+Building the patched FFglitch: `ffglitch/build.sh /tmp/ffg /opt/ffglitch-h264`
+(see `ffglitch/NOTES.md`).
 
 This step is lossy and drops audio — it is a transcode. **The carrier is the
 plaintext.** Everything after this point is bit-exact.

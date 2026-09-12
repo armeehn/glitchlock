@@ -81,6 +81,12 @@ DomainSlot = Tuple[Any, Any, Path, Domain]
 #: under the stream, so there is no ``mv`` payload to scramble. The entries
 #: stay because the geometry is a fact about the codec and a later FFglitch
 #: may expose them; ``select_features`` reports the real reason per file.
+#: H.264 motion vectors have no f_code: mvd is an unbounded se(v) and the
+#: patched FFglitch (see ffglitch/NOTES.md) clamps at +-32767. The domain is
+#: pinned instead to +-512 px in quarter-pel, the Level 3.1 vertical range,
+#: so a hardware decoder still accepts every scrambled vector.
+H264_MV_SPAN = 1 << 12
+
 MV_WIDTH_SHIFT = {
     "mpeg1video": 4,
     "mpeg2video": 4,
@@ -97,6 +103,7 @@ MV_WIDTH_SHIFT = {
 
 #: Features each codec can have locked. Anything absent is refused.
 CODEC_FEATURES = {
+    "h264": ("mv",),
     "mpeg1video": ("mv", "qscale"),
     "mpeg2video": ("mv", "qscale"),
     "mpeg4": ("mv",),
@@ -149,14 +156,20 @@ def _mv_slots(frame_payload: Dict[str, Any], codec: str) -> Iterator[DomainSlot]
     # into a bcode=1 slot came back as -15). P-frames carry no bcode, so fall
     # back to fcode there.
     bcode: List[int] = frame_payload.get("bcode") or fcode
+    if codec == "h264":
+        fcode = bcode = [0]
     if not fcode:
         return
-    shift = mv_width_shift(codec)
+    shift = 0 if codec == "h264" else mv_width_shift(codec)
     for direction, codes in (("forward", fcode), ("backward", bcode)):
         grid = frame_payload.get(direction)
         if not grid:
             continue
         for container, key, rel in walk(grid):
+            if codec == "h264":
+                n = H264_MV_SPAN
+                yield (container, key, (direction,) + rel, (-(n >> 1), n))
+                continue
             # The innermost list is the [x, y] pair, so the final path element
             # is the axis. MPEG-4 reports a single f_code for both axes;
             # MPEG-2 reports one per axis.

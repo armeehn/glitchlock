@@ -154,7 +154,12 @@ def iter_file_segments(path: str, block: int = 65536,
 VOS_HEADER = b"\x00\x00\x01\xb0"
 
 #: Which start code begins a GOP, per codec FFedit can lock.
+#: Annex B start code + SPS NAL header (nal_ref_idc 3, type 7). With x264's
+#: repeat-headers every IDR access unit opens with one, so it marks a GOP.
+SPS_HEADER = b"\x00\x00\x00\x01\x67"
+
 MARKERS = {
+    "h264": SPS_HEADER,
     "mpeg2video": SEQUENCE_HEADER,
     "mpeg1video": SEQUENCE_HEADER,
     "mpeg4": VOS_HEADER,
