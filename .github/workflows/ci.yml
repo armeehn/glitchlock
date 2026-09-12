@@ -50,7 +50,7 @@ jobs:
             "$API/releases/tags/ffglitch-h264-1" \
             | python3 -c 'import sys,json; print(json.load(sys.stdin)["assets"][0]["browser_download_url"])')
           curl -sSfL -H "Authorization: token $TOKEN" -o ffglitch.tar.xz "$url"
-          echo "87b7548989d798a8f7580046a1e8c24028adc354427d33d809f1799f0087c8c5  ffglitch.tar.xz" | sha256sum -c
+          echo "aba051a3759cc6366c3da2c88cbeb01dfb95feca47162aba2d729b8dc792c4f1  ffglitch.tar.xz" | sha256sum -c
           sudo tar -xJf ffglitch.tar.xz -C /opt
           sudo mv /opt/ffglitch-0.10.2-h264 /opt/ffglitch
           echo "/opt/ffglitch" >> "$GITHUB_PATH"

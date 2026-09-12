@@ -8,6 +8,9 @@
 # STATIC=1 link ffedit and ffgac statically (no qjs, no rtmidi/zmq): the
 #          build CI downloads as a release asset, since a binary built on
 #          Arch wants a newer glibc than the Ubuntu runner image has.
+#          Needs a static zlib (libz.a) reachable through
+#          --extra-cflags/--extra-ldflags, e.g. ZLIB=/path/to/zlib-install;
+#          Arch ships none, so build zlib 1.3.1 with ./configure --static.
 #
 # Needs: gcc, make, pkg-config, git, curl, xz. No nasm required (asm is
 # disabled, which is also why the bundled Xvid encoder is left out).
@@ -47,10 +50,11 @@ fi
 if [ "${STATIC:-0}" = 1 ]; then
     CONFIGURE_FLAGS=(
         --disable-doc --enable-gpl --enable-static --disable-shared
-        --disable-autodetect --disable-iconv --disable-zlib
+        --disable-autodetect --disable-iconv --enable-zlib
         --disable-libxvid --disable-libzmq --disable-rtmidi
         --disable-x86asm --disable-ffplay --disable-ffprobe
-        --extra-ldflags=-static --pkg-config-flags=--static
+        --extra-cflags=-I${ZLIB:?set ZLIB to a static zlib prefix}/include
+        --extra-ldflags="-static -L$ZLIB/lib" --pkg-config-flags=--static
     )
 fi
 
