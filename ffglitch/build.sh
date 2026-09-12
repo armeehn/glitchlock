@@ -5,6 +5,9 @@
 #
 # SRC_DIR  where the tree is unpacked (default ./ffglitch-h264-build)
 # PREFIX   if set, ffedit/ffgac/qjs are copied there (e.g. /opt/ffglitch-h264)
+# STATIC=1 link ffedit and ffgac statically (no qjs, no rtmidi/zmq): the
+#          build CI downloads as a release asset, since a binary built on
+#          Arch wants a newer glibc than the Ubuntu runner image has.
 #
 # Needs: gcc, make, pkg-config, git, curl, xz. No nasm required (asm is
 # disabled, which is also why the bundled Xvid encoder is left out).
@@ -41,12 +44,31 @@ if [ ! -d .git ]; then
     git -c user.name=build -c user.email=build@localhost am "$PATCH_DIR"/0*.patch
 fi
 
+if [ "${STATIC:-0}" = 1 ]; then
+    CONFIGURE_FLAGS=(
+        --disable-doc --enable-gpl --enable-static --disable-shared
+        --disable-autodetect --disable-iconv --disable-zlib
+        --disable-libxvid --disable-libzmq --disable-rtmidi
+        --disable-x86asm --disable-ffplay --disable-ffprobe
+        --extra-ldflags=-static --pkg-config-flags=--static
+    )
+fi
+
 ./configure "${CONFIGURE_FLAGS[@]}"
-make -j"$JOBS"
-make -j"$JOBS" qjs
+if [ "${STATIC:-0}" = 1 ]; then
+    # --disable-rtmidi still leaves -lasound in the link line, and there is
+    # no static ALSA to satisfy it; nothing references it once rtmidi is off.
+    sed -i 's/-lasound//g' ffbuild/config.mak
+    make -j"$JOBS" ffedit ffgac
+    BINS=(ffedit ffgac)
+else
+    make -j"$JOBS"
+    make -j"$JOBS" qjs
+    BINS=(ffedit ffgac qjs)
+fi
 
 if [ -n "$PREFIX" ]; then
     mkdir -p "$PREFIX"
-    cp ffedit ffgac qjs "$PREFIX"/
+    cp "${BINS[@]}" "$PREFIX"/
     echo "installed to $PREFIX"
 fi
