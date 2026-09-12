@@ -96,6 +96,14 @@ class KeyStream:
         self._pos = 0
 
     def read(self, count: int) -> bytes:
+        # Fast path: the draw fits in the current block. randbelow asks for
+        # one or two bytes at a time, so this is nearly every call.
+        end = self._pos + count
+        if end <= len(self._buf):
+            start = self._pos
+            self._pos = end
+            return self._buf[start:end]
+
         out = bytearray()
         while len(out) < count:
             if self._pos >= len(self._buf):

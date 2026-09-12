@@ -8,7 +8,7 @@ import os
 import sys
 from typing import Optional, Tuple
 
-from . import __version__, ffg, pubkey
+from . import __version__, ffg, mp2, pubkey
 from .core import LockError, lock, lockable_features, select_features, unlock
 from .crypto import (
     SCRYPT_N,
@@ -126,7 +126,29 @@ def _resolve_key_for_unlock(args, manifest: Manifest) -> bytes:
 # ----------------------------------------------------------------- commands
 
 
+def _inspect_audio(args) -> int:
+    with open(args.input, "rb") as fh:
+        info = mp2.describe(fh.read())
+    print(f"file:     {args.input}")
+    print(f"codec:    {mp2.CODEC_NAME} ({info.version} Audio Layer II)")
+    print(f"stream:   {info.samplerate} Hz, {info.mode}, {info.bitrate_kbps} kbps, "
+          f"{info.frames} frames ({info.seconds:.1f} s)")
+    print(f"crc:      {info.protected}/{info.frames} frames protected")
+    if info.junk_bytes:
+        print(f"junk:     {info.junk_bytes} bytes outside any frame (carried verbatim)")
+    print(f"sha256:   {sha256_file(args.input)}")
+    print()
+    print(f"lockable features: {', '.join(mp2.FEATURES)}")
+    return 0
+
+
 def cmd_inspect(args) -> int:
+    layer = mp2.sniff_file(args.input)
+    if layer == mp2.LAYER_NAMES[mp2.LAYER_II]:
+        return _inspect_audio(args)
+    if layer is not None:
+        _err(f"MPEG audio {layer} is not supported; only Layer II (MP2) is")
+        return 1
     codec = ffg.codec_name(args.input)
     print(f"ffglitch: {ffg.version()}")
     print(f"file:     {args.input}")
@@ -413,7 +435,8 @@ def cmd_verify(args) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="glitchlock",
-        description="Reversible, keyed bitstream scrambling for video, built on FFglitch.",
+        description="Reversible, keyed bitstream scrambling for video (via FFglitch) "
+                    "and MP2 audio.",
     )
     parser.add_argument("--version", action="version", version=f"glitchlock {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -445,7 +468,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("input")
     p.add_argument("-o", "--output", required=True)
     p.add_argument("-m", "--manifest", required=True)
-    p.add_argument("--features", help=f"comma separated; default: all of {','.join(SUPPORTED_FEATURES)} present")
+    p.add_argument("--features",
+                   help=f"comma separated; default: all of {','.join(SUPPORTED_FEATURES)} "
+                        f"present (video) or {','.join(mp2.FEATURES)} (MP2)")
     p.add_argument("--mode", default="full", choices=list(MODES))
     p.add_argument("--intensity", type=float, default=1.0,
                    help="fraction of slots to scramble, 0 < i <= 1 (default 1.0)")
