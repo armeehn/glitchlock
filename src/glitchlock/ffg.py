@@ -128,6 +128,36 @@ def write_json(doc: Dict[str, Any], path: str) -> None:
 
 DEFAULT_TRANSCODE_FLAGS = ["-mpv_flags", "+nopimb+forcemv"]
 
+#: x264 quality for an H.264 carrier; --qscale is an MPEG notion and is ignored.
+H264_CRF = 23
+#: B-frames per GOP in the Main-profile CAVLC carrier. Baseline would need 0.
+H264_BFRAMES = 2
+
+
+def _transcode_h264(src: str, dst: str, gop: int, closed_gop: bool,
+                    extra: Optional[List[str]]) -> None:
+    """H.264 carrier through the system ffmpeg's libx264: FFglitch's ffgac has
+    no H.264 encoder. CAVLC is mandatory (the patched ffedit refuses CABAC);
+    repeated SPS/PPS give every IDR a splittable start code for streaming."""
+    params = [
+        "cabac=0", f"bframes={H264_BFRAMES}", "repeat-headers=1",
+        f"keyint={gop}", f"min-keyint={gop}",
+    ]
+    if closed_gop:
+        params += ["scenecut=0", "open-gop=0"]
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise FFglitchMissing("an H.264 carrier needs ffmpeg with libx264 on PATH")
+    cmd = [
+        ffmpeg, "-v", "error", "-y", "-i", src, "-an",
+        "-c:v", "libx264", "-profile:v", "main", "-crf", str(H264_CRF),
+        "-x264-params", ":".join(params), "-f", "h264",
+    ]
+    if extra:
+        cmd += extra
+    cmd.append(dst)
+    _run(cmd)
+
 
 def transcode(
     src: str,
@@ -148,6 +178,9 @@ def transcode(
     is what lets a stream be cut into independently lockable segments. See
     :mod:`glitchlock.stream`.
     """
+    if codec == "h264":
+        _transcode_h264(src, dst, gop, closed_gop, extra)
+        return
     cmd = [
         ffgac_path(), "-v", "error", "-y", "-i", src, "-an",
         *DEFAULT_TRANSCODE_FLAGS,

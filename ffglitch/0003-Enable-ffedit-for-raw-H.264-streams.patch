@@ -1,0 +1,48 @@
+From 249bb930ff054be19ffb1de0ea970d6ac4bdfac8 Mon Sep 17 00:00:00 2001
+From: Sasha Zero <sasha@ripostelabs.xyz>
+Date: Sat, 12 Sep 2026 08:44:36 -0700
+Subject: [PATCH 3/3] Enable ffedit for raw H.264 streams
+
+Flag the raw H.264 demuxer as an ffedit raw bitstream and advertise
+the mv/mv_delta features on the H.264 decoder, so ffedit accepts
+Annex B .264 files for export, apply and plain copy.
+
+Only the raw demuxer is flagged: AVCC containers (MP4/MKV) prefix
+each NAL with its length, which the rebuilt NALs would invalidate.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ libavcodec/h264dec.c  | 5 ++++-
+ libavformat/h264dec.c | 3 ++-
+ 2 files changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/libavcodec/h264dec.c b/libavcodec/h264dec.c
+index 9dac5b8..a708dab 100644
+--- a/libavcodec/h264dec.c
++++ b/libavcodec/h264dec.c
+@@ -1144,7 +1144,10 @@ const FFCodec ff_h264_decoder = {
+     FF_CODEC_DECODE_CB(h264_decode_frame),
+     .p.capabilities        = AV_CODEC_CAP_DR1 |
+                              AV_CODEC_CAP_DELAY | AV_CODEC_CAP_SLICE_THREADS |
+-                             AV_CODEC_CAP_FRAME_THREADS,
++                             AV_CODEC_CAP_FRAME_THREADS |
++                             AV_CODEC_CAP_FFEDIT_BITSTREAM,
++    .p.ffedit_features     = (1 << FFEDIT_FEAT_MV)
++                           | (1 << FFEDIT_FEAT_MV_DELTA),
+     .hw_configs            = (const AVCodecHWConfigInternal *const []) {
+ #if CONFIG_H264_DXVA2_HWACCEL
+                                HWACCEL_DXVA2(h264),
+diff --git a/libavformat/h264dec.c b/libavformat/h264dec.c
+index ac804c0..16cd722 100644
+--- a/libavformat/h264dec.c
++++ b/libavformat/h264dec.c
+@@ -116,4 +116,5 @@ static int h264_probe(const AVProbeData *p)
+     return 0;
+ }
+ 
+-FF_DEF_RAWVIDEO_DEMUXER(h264, "raw H.264 video", h264_probe, "h26l,h264,264,avc", AV_CODEC_ID_H264)
++FF_DEF_RAWVIDEO_DEMUXER2(h264, "raw H.264 video", h264_probe, "h26l,h264,264,avc",
++                         AV_CODEC_ID_H264, AVFMT_GENERIC_INDEX | AVFMT_FFEDIT_BITSTREAM | AVFMT_FFEDIT_RAWSTREAM)
+-- 
+2.55.0
+

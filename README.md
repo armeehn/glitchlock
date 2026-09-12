@@ -101,13 +101,24 @@ If FFglitch lives somewhere unusual, point at it with
 
 ### prepare — make a lockable carrier
 
-Most video is H.264/HEVC, which exposes nothing reversible. `prepare` transcodes
+Stock FFglitch exposes nothing reversible for H.264/HEVC. `prepare` transcodes
 to a glitchable MPEG-2 or MPEG-4 elementary stream using the standard FFglitch
-encoder recipe (`+nopimb+forcemv`, so every macroblock carries a real vector).
+encoder recipe (`+nopimb+forcemv`, so every macroblock carries a real vector),
+or to H.264 when the patched `ffedit` from [ffglitch/](ffglitch/) is on PATH.
 
 ```console
 $ glitchlock prepare input.mkv -o carrier.mpg --codec mpeg2video --qscale 6 --gop 25
+$ glitchlock prepare input.mkv -o carrier.264 --codec h264 --gop 25 --closed-gop
 ```
+
+The H.264 carrier is Main profile with CAVLC entropy coding and two B-frames,
+made by the system `ffmpeg`'s libx264 (`--qscale` does not apply; it uses
+CRF 23). CAVLC matters: motion vector differences are plain Exp-Golomb codes
+there, so an edited vector never changes the shape of the bitstream. CABAC
+streams are refused, not corrupted. Scrambled vectors stay within ±512 px,
+the Level 3.1 vertical range, so hardware decoders still play the result.
+Building the patched FFglitch: `ffglitch/build.sh /tmp/ffg /opt/ffglitch-h264`
+(see `ffglitch/NOTES.md`).
 
 This step is lossy and drops audio — it is a transcode. **The carrier is the
 plaintext.** Everything after this point is bit-exact.
@@ -202,6 +213,20 @@ The receiver finds segment boundaries by scanning the locked stream itself, and
 can synthesise its manifest from session parameters — so nothing has to be sent
 alongside the video. Latency is one GOP (480 ms at GOP 12/25 fps). 720p keeps up
 with a live feed on 4 cores; 1080p needs more.
+
+`stream-lock` and `stream-unlock` do this over pipes, so the sender and the
+receiver are one command each. The receiver needs the key and a small session
+record (nonce, codec, features, first segment number); no manifest travels:
+
+```console
+$ glitchlock prepare live.mkv -o carrier.m4v --codec mpeg4 --closed-gop
+$ glitchlock stream-lock -i carrier.m4v --key-file key.bin --session s.json --gops 5 | nc host 9000
+$ nc -l 9000 | glitchlock stream-unlock --session s.json --key-file key.bin | ffplay -f m4v -
+```
+
+Segments are locked by a worker pool but written strictly in order, and at
+most twice `--workers` are in flight, so memory stays bounded. A stream that
+ends inside a GOP fails on its last piece only; everything before it is out.
 
 See [docs/pdf/streaming.pdf](docs/pdf/streaming.pdf) for the measurements and for what is still
 missing — there is no TS/HLS wrapping, no audio path and no daemon yet.

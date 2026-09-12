@@ -1,0 +1,1003 @@
+From afa6a3c7fedbbf164b6543931adb3e5476f02537 Mon Sep 17 00:00:00 2001
+From: Sasha Zero <sasha@ripostelabs.xyz>
+Date: Sat, 12 Sep 2026 08:44:36 -0700
+Subject: [PATCH 2/3] Add H.264 CAVLC mvd hooks to ffedit
+
+Export and re-apply every mvd syntax element of P and B macroblocks
+(all partition and sub-partition shapes) as the "mv" (final vector,
+pred + mvd) and "mv_delta" (raw mvd) features. CAVLC, progressive
+frames only.
+
+The MPEG-4 path mirrors every bit read into a PutBitContext. That
+does not fit H.264, where the decoder works on an RBSP with the
+emulation prevention bytes stripped and the CAVLC residual reader
+uses raw cache macros. Instead, ffe_h264_mvd() wraps the se(v) reads
+in h264_cavlc.c and records the bit range and replacement value of
+each edited mvd. After the slice is decoded, ffe_h264_nal_done()
+rebuilds the NAL: unchanged bits are copied, the recorded ranges are
+re-encoded as se(v), rbsp_trailing_bits are regenerated and the
+emulation prevention bytes are re-inserted. NALs without edits and
+everything between NALs are copied verbatim, so an unedited round
+trip is bit-exact.
+
+Frame lifecycle follows the MPEG-4 hooks: JSON contexts are attached
+to the picture's AVFrame at frame start and finalised in
+ff_h264_field_end(). CABAC, field/MBAFF pictures and length-prefixed
+(AVCC) input are refused with a clear message when an mv feature is
+requested; plain copies of such files still work.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ libavcodec/Makefile       |   1 +
+ libavcodec/ffedit_h264.c  | 617 ++++++++++++++++++++++++++++++++++++++
+ libavcodec/ffedit_h264.h  | 112 +++++++
+ libavcodec/h264_cavlc.c   |  24 +-
+ libavcodec/h264_picture.c |   2 +
+ libavcodec/h264_slice.c   |   3 +
+ libavcodec/h264dec.c      |  25 +-
+ libavcodec/h264dec.h      |   7 +
+ 8 files changed, 781 insertions(+), 10 deletions(-)
+ create mode 100644 libavcodec/ffedit_h264.c
+ create mode 100644 libavcodec/ffedit_h264.h
+
+diff --git a/libavcodec/Makefile b/libavcodec/Makefile
+index 6d430cf..40581ca 100644
+--- a/libavcodec/Makefile
++++ b/libavcodec/Makefile
+@@ -409,6 +409,7 @@ OBJS-$(CONFIG_H263_ENCODER)            += mpeg4video.o  \
+ OBJS-$(CONFIG_H263_V4L2M2M_DECODER)    += v4l2_m2m_dec.o
+ OBJS-$(CONFIG_H263_V4L2M2M_ENCODER)    += v4l2_m2m_enc.o
+ OBJS-$(CONFIG_H264_DECODER)            += h264dec.o h264_cabac.o h264_cavlc.o \
++                                          ffedit_h264.o \
+                                           h264_direct.o h264_loopfilter.o  \
+                                           h264_mb.o h264_picture.o \
+                                           h264_refs.o \
+diff --git a/libavcodec/ffedit_h264.c b/libavcodec/ffedit_h264.c
+new file mode 100644
+index 0000000..55a4293
+--- /dev/null
++++ b/libavcodec/ffedit_h264.c
+@@ -0,0 +1,617 @@
++/*
++ * Copyright (c) 2026 Riposte Laboratories
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#include <stdlib.h>
++#include <string.h>
++
++#include "libavutil/intmath.h"
++#include "libavutil/mem.h"
++
++#include "ffedit.h"
++#include "ffedit_h264.h"
++#include "ffedit_json.h"
++#include "ffedit_mv.h"
++#include "get_bits.h"
++#include "golomb.h"
++#include "h264dec.h"
++#include "h264_ps.h"
++#include "put_bits.h"
++#include "put_golomb.h"
++
++/* JSON directions: 0 = list0 ("forward"), 1 = list1 ("backward") */
++#define NB_DIRECTIONS 2
++/* 4 8x8 partitions x 4 sub-partitions */
++#define MAX_MVS_PER_LIST 16
++
++/* set_se_golomb() writes 16-bit code numbers at most */
++#define MVD_MIN (-32767)
++#define MVD_MAX ( 32767)
++
++/* upper bound on a rebuilt se(v) code, in bits */
++#define MAX_SEV_BITS 33
++/* NAL header byte precedes the slice header in the RBSP */
++#define NAL_HEADER_BITS 8
++/* longest chunk get_bits() can read at once */
++#define COPY_CHUNK_BITS 24
++/* emulation prevention: 00 00 0x with x <= 3 needs a 03 in between */
++#define EPB_MAX_FOLLOWING 3
++
++#define FEAT_MASK_MV ((1 << FFEDIT_FEAT_MV) | (1 << FFEDIT_FEAT_MV_DELTA))
++#define FEAT_MASK_OUTPUT (1 << FFEDIT_FEAT_LAST)
++
++/*-------------------------------------------------------------------*/
++int ffe_h264_wants_mv(const AVCodecContext *avctx)
++{
++    uint64_t all = avctx->ffedit_export
++                 | avctx->ffedit_import
++                 | avctx->ffedit_apply;
++    return (all & FEAT_MASK_MV) != 0;
++}
++
++/*-------------------------------------------------------------------*/
++/* growable output packet                                            */
++/*-------------------------------------------------------------------*/
++static int out_append(FFEditH264Context *fe, const uint8_t *data, size_t size)
++{
++    void *tmp;
++
++    if ( size == 0 )
++        return 0;
++
++    tmp = av_fast_realloc(fe->out, &fe->out_alloc, fe->out_size + size);
++    if ( tmp == NULL )
++    {
++        fe->out_failed = 1;
++        return AVERROR(ENOMEM);
++    }
++    fe->out = tmp;
++
++    memcpy(fe->out + fe->out_size, data, size);
++    fe->out_size += size;
++
++    return 0;
++}
++
++/* append an RBSP as a NAL payload, re-inserting emulation prevention */
++static int out_append_escaped(FFEditH264Context *fe, const uint8_t *rbsp, size_t size)
++{
++    /* at most one 0x03 per two input bytes */
++    uint8_t *esc = av_malloc(size + size / 2 + 1);
++    size_t n = 0;
++    int zeros = 0;
++    int ret;
++
++    if ( esc == NULL )
++        return AVERROR(ENOMEM);
++
++    for ( size_t i = 0; i < size; i++ )
++    {
++        uint8_t b = rbsp[i];
++
++        if ( zeros >= 2 && b <= EPB_MAX_FOLLOWING )
++        {
++            esc[n++] = 0x03;
++            zeros = 0;
++        }
++        esc[n++] = b;
++        zeros = (b == 0) ? zeros + 1 : 0;
++    }
++
++    ret = out_append(fe, esc, n);
++    av_free(esc);
++
++    return ret;
++}
++
++/*-------------------------------------------------------------------*/
++/* packet level                                                      */
++/*-------------------------------------------------------------------*/
++void ffe_h264_packet_start(H264Context *h, const AVPacket *avpkt)
++{
++    FFEditH264Context *fe = &h->ffe;
++    AVCodecContext *avctx = h->avctx;
++
++    if ( avctx->ffedit_import != 0 )
++    {
++        memcpy(fe->ffedit_sd, avpkt->ffedit_sd, sizeof(fe->ffedit_sd));
++        fe->jctx = avpkt->jctx;
++    }
++
++    fe->out_active = (avctx->ffedit_apply & FEAT_MASK_OUTPUT) != 0;
++    fe->out_failed = 0;
++    fe->out_size = 0;
++    fe->in_buf = avpkt->data;
++    fe->in_size = avpkt->size;
++    fe->in_pos = 0;
++}
++
++/* hand the rebuilt packet to ffedit (same bookkeeping as
++ * ffe_transplicate_bits_flush()) */
++static void xp_flush(AVCodecContext *avctx, const AVPacket *pkt, const uint8_t *data, size_t size)
++{
++    FFEditTransplicatePacket *packet;
++    size_t nb = avctx->nb_ffe_xp_packets + 1;
++
++    if ( av_reallocp_array(&avctx->ffe_xp_packets, nb, sizeof(FFEditTransplicatePacket)) < 0 )
++        return;
++    avctx->nb_ffe_xp_packets = nb;
++
++    packet = &avctx->ffe_xp_packets[nb - 1];
++    packet->i_pos = pkt->pos;
++    packet->i_size = pkt->size;
++    packet->o_size = size;
++    packet->data = av_malloc(size);
++    memcpy(packet->data, data, size);
++}
++
++void ffe_h264_packet_end(H264Context *h, const AVPacket *avpkt)
++{
++    FFEditH264Context *fe = &h->ffe;
++
++    if ( !fe->out_active )
++        return;
++    fe->out_active = 0;
++
++    /* whatever follows the last NAL we looked at is copied as is */
++    out_append(fe, fe->in_buf + fe->in_pos, fe->in_size - fe->in_pos);
++
++    if ( fe->out_failed )
++    {
++        av_log(ffe_class, AV_LOG_WARNING,
++               "H.264 packet at %" PRId64 " could not be rebuilt, copied unchanged\n",
++               avpkt->pos);
++        xp_flush(h->avctx, avpkt, avpkt->data, avpkt->size);
++        return;
++    }
++
++    xp_flush(h->avctx, avpkt, fe->out, fe->out_size);
++}
++
++/*-------------------------------------------------------------------*/
++/* NAL rebuild                                                       */
++/*-------------------------------------------------------------------*/
++static void copy_bits(PutBitContext *pb, GetBitContext *gb, int nb_bits)
++{
++    while ( nb_bits > 0 )
++    {
++        int n = FFMIN(nb_bits, COPY_CHUNK_BITS);
++        put_bits(pb, n, get_bits(gb, n));
++        nb_bits -= n;
++    }
++}
++
++/* bit index of the rbsp_stop_one_bit, or -1 */
++static int find_stop_bit(const H2645NAL *nal)
++{
++    int last = nal->size - 1;
++
++    while ( last >= 0 && nal->data[last] == 0 )
++        last--;
++    if ( last < 0 )
++        return -1;
++
++    return last * 8 + 7 - ff_ctz(nal->data[last]);
++}
++
++/* rebuild one slice NAL with the recorded mvd edits applied.
++ * returns the new RBSP (caller frees) or NULL. */
++static uint8_t *rebuild_rbsp(
++        const H2645NAL *nal,
++        const FFEditH264MvdEdit *edits,
++        int nb_edits,
++        size_t *out_size)
++{
++    int stop_pos = find_stop_bit(nal);
++    size_t alloc;
++    uint8_t *rbsp;
++    PutBitContext pb;
++    GetBitContext gb;
++    int pos = 0;
++    int rem;
++
++    if ( stop_pos < NAL_HEADER_BITS )
++        return NULL;
++
++    /* edits must be in order and inside the slice data */
++    for ( int i = 0; i < nb_edits; i++ )
++    {
++        const FFEditH264MvdEdit *e = &edits[i];
++        if ( e->pos < pos || e->pos + e->len > stop_pos )
++            return NULL;
++        pos = e->pos + e->len;
++    }
++    pos = 0;
++
++    alloc = (stop_pos + 7) / 8 + ((size_t) nb_edits * MAX_SEV_BITS) / 8 + AV_INPUT_BUFFER_PADDING_SIZE;
++    rbsp = av_malloc(alloc);
++    if ( rbsp == NULL )
++        return NULL;
++
++    init_put_bits(&pb, rbsp, alloc);
++    init_get_bits(&gb, nal->data, nal->size * 8);
++
++    for ( int i = 0; i < nb_edits; i++ )
++    {
++        const FFEditH264MvdEdit *e = &edits[i];
++
++        copy_bits(&pb, &gb, e->pos - pos);
++        skip_bits_long(&gb, e->len);
++        set_se_golomb(&pb, e->val);
++        pos = e->pos + e->len;
++    }
++    copy_bits(&pb, &gb, stop_pos - pos);
++
++    /* rbsp_trailing_bits() */
++    put_bits(&pb, 1, 1);
++    rem = put_bits_count(&pb) & 7;
++    if ( rem != 0 )
++        put_bits(&pb, 8 - rem, 0);
++    flush_put_bits(&pb);
++
++    *out_size = put_bytes_output(&pb);
++
++    return rbsp;
++}
++
++void ffe_h264_nal_done(H264Context *h, const H2645NAL *nal)
++{
++    FFEditH264Context *fe = &h->ffe;
++    H264SliceContext *sl = &h->slice_ctx[0];
++    FFEditH264SliceContext *fsl = &sl->ffe;
++    int is_slice = nal->type == H264_NAL_SLICE || nal->type == H264_NAL_IDR_SLICE;
++    int nb_edits = is_slice ? fsl->nb_edits : 0;
++    size_t off;
++
++    /* edits belong to this NAL only */
++    fsl->nb_edits = 0;
++
++    if ( !fe->out_active || fe->out_failed )
++        return;
++
++    off = nal->raw_data - fe->in_buf;
++    if ( nal->raw_data < fe->in_buf || off < fe->in_pos || off + nal->raw_size > fe->in_size )
++    {
++        fe->out_failed = 1;
++        return;
++    }
++
++    /* start code and anything else between NALs */
++    out_append(fe, fe->in_buf + fe->in_pos, off - fe->in_pos);
++    fe->in_pos = off + nal->raw_size;
++
++    if ( nb_edits == 0 )
++    {
++        out_append(fe, nal->raw_data, nal->raw_size);
++        return;
++    }
++
++    {
++        size_t rbsp_size = 0;
++        uint8_t *rbsp = rebuild_rbsp(nal, fsl->edits, nb_edits, &rbsp_size);
++
++        if ( rbsp == NULL )
++        {
++            fe->out_failed = 1;
++            return;
++        }
++
++        out_append_escaped(fe, rbsp, rbsp_size);
++        av_free(rbsp);
++    }
++}
++
++/*-------------------------------------------------------------------*/
++/* slice level                                                       */
++/*-------------------------------------------------------------------*/
++void ffe_h264_slice_start(H264SliceContext *sl)
++{
++    sl->ffe.nb_edits = 0;
++}
++
++void ffe_h264_check_slice(const H264Context *h, const H264SliceContext *sl)
++{
++    const PPS *pps = h->ps.pps;
++    const SPS *sps = h->ps.sps;
++
++    if ( !ffe_h264_wants_mv(h->avctx) )
++        return;
++
++    if ( h->is_avc )
++    {
++        av_log(ffe_class, AV_LOG_FATAL,
++               "This H.264 stream is length-prefixed (AVCC, e.g. inside MP4/MKV).\n");
++        av_log(ffe_class, AV_LOG_FATAL,
++               "FFedit only supports the mv/mv_delta features on raw Annex B H.264 (.264/.h264).\n");
++        exit(1);
++    }
++
++    if ( pps != NULL && pps->cabac )
++    {
++        av_log(ffe_class, AV_LOG_FATAL,
++               "This H.264 stream uses CABAC (entropy_coding_mode_flag=1).\n");
++        av_log(ffe_class, AV_LOG_FATAL,
++               "FFedit only supports the mv/mv_delta features on CAVLC streams.\n");
++        av_log(ffe_class, AV_LOG_FATAL,
++               "Re-encode with CAVLC (e.g. x264 -x264-params cabac=0).\n");
++        exit(1);
++    }
++
++    if ( sl->picture_structure != PICT_FRAME || (sps != NULL && sps->mb_aff) )
++    {
++        av_log(ffe_class, AV_LOG_FATAL,
++               "This H.264 stream uses field or MBAFF coding.\n");
++        av_log(ffe_class, AV_LOG_FATAL,
++               "FFedit only supports the mv/mv_delta features on progressive frames.\n");
++        exit(1);
++    }
++
++    if ( h->nb_slice_ctx != 1 )
++    {
++        av_log(ffe_class, AV_LOG_FATAL,
++               "FFedit H.264 support requires a single slice context (threads=1).\n");
++        exit(1);
++    }
++}
++
++/*-------------------------------------------------------------------*/
++/* frame level                                                       */
++/*-------------------------------------------------------------------*/
++void ffe_h264_frame_start(H264Context *h)
++{
++    AVCodecContext *avctx = h->avctx;
++    FFEditH264Context *fe = &h->ffe;
++    AVFrame *f = h->cur_pic_ptr->f;
++    json_ctx_t *jctx;
++
++    if ( avctx->ffedit_export == 0 && avctx->ffedit_import == 0 )
++        return;
++
++    /* one jctx per exported frame; importing borrows the packet's */
++    if ( avctx->ffedit_export != 0 )
++    {
++        f->jctx = json_ctx_new(1);
++        jctx = f->jctx;
++    }
++    else
++    {
++        jctx = fe->jctx;
++    }
++
++    if ( avctx->ffedit_import != 0 )
++        memcpy(f->ffedit_sd, fe->ffedit_sd, sizeof(json_t *) * FFEDIT_FEAT_LAST);
++
++    if ( (avctx->ffedit_export & (1 << FFEDIT_FEAT_MV)) != 0 )
++        ffe_mv_export_init_dirs(FFEDIT_FEAT_MV, jctx, f, h->mb_height, h->mb_width, NB_DIRECTIONS, MAX_MVS_PER_LIST);
++    else if ( (avctx->ffedit_import & (1 << FFEDIT_FEAT_MV)) != 0 && f->ffedit_sd[FFEDIT_FEAT_MV] != NULL )
++        ffe_mv_import_init(jctx, f);
++
++    if ( (avctx->ffedit_export & (1 << FFEDIT_FEAT_MV_DELTA)) != 0 )
++        ffe_mv_export_init_dirs(FFEDIT_FEAT_MV_DELTA, jctx, f, h->mb_height, h->mb_width, NB_DIRECTIONS, MAX_MVS_PER_LIST);
++    else if ( (avctx->ffedit_import & (1 << FFEDIT_FEAT_MV_DELTA)) != 0 && f->ffedit_sd[FFEDIT_FEAT_MV_DELTA] != NULL )
++        ffe_mv_delta_import_init(jctx, f);
++
++    fe->frame_active = 1;
++}
++
++void ffe_h264_frame_end(H264Context *h)
++{
++    AVCodecContext *avctx = h->avctx;
++    FFEditH264Context *fe = &h->ffe;
++    AVFrame *f;
++
++    if ( !fe->frame_active || h->cur_pic_ptr == NULL )
++        return;
++    fe->frame_active = 0;
++
++    f = h->cur_pic_ptr->f;
++    if ( (avctx->ffedit_export & (1 << FFEDIT_FEAT_MV)) != 0 )
++        ffe_mv_export_cleanup_dirs(FFEDIT_FEAT_MV, f->jctx, f);
++    if ( (avctx->ffedit_export & (1 << FFEDIT_FEAT_MV_DELTA)) != 0 )
++        ffe_mv_export_cleanup_dirs(FFEDIT_FEAT_MV_DELTA, f->jctx, f);
++}
++
++/*-------------------------------------------------------------------*/
++/* macroblock level                                                  */
++/*-------------------------------------------------------------------*/
++void ffe_h264_mb_start(H264SliceContext *sl)
++{
++    FFEditH264SliceContext *fsl = &sl->ffe;
++
++    memset(&fsl->mv, 0, sizeof(fsl->mv));
++    memset(&fsl->mv_delta, 0, sizeof(fsl->mv_delta));
++    fsl->mv.mb_y = fsl->mv_delta.mb_y = sl->mb_y;
++    fsl->mv.mb_x = fsl->mv_delta.mb_x = sl->mb_x;
++}
++
++/* read one component of a [x,y] pair, or fallback */
++static int pair_get(json_t *jmv, int x_or_y, int fallback)
++{
++    if ( jmv == NULL )
++        return fallback;
++
++    if ( JSON_TYPE(jmv->flags) == JSON_TYPE_ARRAY_OF_INTS && json_array_length(jmv) == 2 )
++        return jmv->array_of_ints[x_or_y];
++
++    if ( JSON_TYPE(jmv->flags) == JSON_TYPE_ARRAY && json_array_length(jmv) == 2 )
++    {
++        json_t *jval = json_array_get(jmv, x_or_y);
++        if ( jval != NULL && JSON_TYPE(jval->flags) == JSON_TYPE_NUMBER && !is_json_null(jval) )
++            return json_int_val(jval);
++    }
++
++    return fallback;
++}
++
++/* look up the imported value for this block; the JSON per MB is
++ * null, [x,y] (one block) or [[x,y],...] (blocks in decode order). */
++static int import_get(
++        const ffe_mv_mb_ctx *mbctx,
++        AVFrame *f,
++        enum FFEditFeature feat,
++        int dir,
++        int blockn,
++        int x_or_y,
++        int fallback)
++{
++    json_t *jframe = f->ffedit_sd[feat];
++    ffe_mv_ctx *ctx;
++    json_t *jdata;
++    json_t *jrow;
++    json_t *jmb;
++
++    if ( jframe == NULL )
++        return fallback;
++    ctx = json_object_userdata_get(jframe);
++    if ( ctx == NULL )
++        return fallback;
++    jdata = ctx->data[dir];
++    if ( jdata == NULL )
++        return fallback;
++
++    /* scripting hands us the native 2d array back */
++    if ( ctx->import_is_mv2darray[dir] )
++    {
++        json_mv2darray_t *jmv2d = jdata->mv2darray;
++        size_t idx = mbctx->mb_y * jmv2d->width + mbctx->mb_x;
++        int32_t *mv;
++
++        if ( blockn >= jmv2d->max_nb_blocks || mbctx->mb_y >= jmv2d->height || mbctx->mb_x >= jmv2d->width )
++            return fallback;
++        mv = &jmv2d->mvs[blockn][idx << 1];
++        if ( mv[0] == MV_NULL )
++            return fallback;
++        return mv[x_or_y];
++    }
++
++    if ( JSON_TYPE(jdata->flags) != JSON_TYPE_ARRAY || json_array_length(jdata) <= mbctx->mb_y )
++        return fallback;
++    jrow = json_array_get(jdata, mbctx->mb_y);
++    if ( jrow == NULL || JSON_TYPE(jrow->flags) != JSON_TYPE_ARRAY || json_array_length(jrow) <= mbctx->mb_x )
++        return fallback;
++    jmb = json_array_get(jrow, mbctx->mb_x);
++    if ( jmb == NULL )
++        return fallback;
++
++    if ( JSON_TYPE(jmb->flags) == JSON_TYPE_ARRAY )
++    {
++        if ( json_array_length(jmb) <= blockn )
++            return fallback;
++        jmb = json_array_get(jmb, blockn);
++    }
++    else if ( blockn != 0 )
++    {
++        return fallback;
++    }
++
++    return pair_get(jmb, x_or_y, fallback);
++}
++
++static void record_edit(FFEditH264SliceContext *fsl, int pos, int len, int val)
++{
++    size_t need = (fsl->nb_edits + 1) * sizeof(FFEditH264MvdEdit);
++    void *tmp = av_fast_realloc(fsl->edits, &fsl->edits_alloc, need);
++
++    if ( tmp == NULL )
++        return;
++    fsl->edits = tmp;
++
++    fsl->edits[fsl->nb_edits].pos = pos;
++    fsl->edits[fsl->nb_edits].len = len;
++    fsl->edits[fsl->nb_edits].val = val;
++    fsl->nb_edits++;
++}
++
++static int clamp_mvd(int mvd)
++{
++    static int warned = 0;
++    int clamped = av_clip(mvd, MVD_MIN, MVD_MAX);
++
++    if ( clamped != mvd && !warned )
++    {
++        warned = 1;
++        av_log(ffe_class, AV_LOG_WARNING,
++               "H.264 mvd %d outside [%d, %d], truncated (further warnings suppressed)\n",
++               mvd, MVD_MIN, MVD_MAX);
++    }
++
++    return clamped;
++}
++
++int ffe_h264_mvd(
++        const H264Context *h,
++        H264SliceContext *sl,
++        int list,
++        int blockn,
++        int x_or_y,
++        int pred)
++{
++    const AVCodecContext *avctx = h->avctx;
++    FFEditH264SliceContext *fsl = &sl->ffe;
++    AVFrame *f = h->cur_pic_ptr->f;
++    int pos = get_bits_count(&sl->gb);
++    int mvd = get_se_golomb(&sl->gb);
++    int len = get_bits_count(&sl->gb) - pos;
++    int orig = mvd;
++
++    if ( (avctx->ffedit_import & (1 << FFEDIT_FEAT_MV_DELTA)) != 0 )
++    {
++        mvd = import_get(&fsl->mv_delta, f, FFEDIT_FEAT_MV_DELTA, list, blockn, x_or_y, mvd);
++        mvd = clamp_mvd(mvd);
++    }
++
++    /* "mv" is the final vector; the stream carries the difference */
++    if ( (avctx->ffedit_import & (1 << FFEDIT_FEAT_MV)) != 0 )
++    {
++        int mv = import_get(&fsl->mv, f, FFEDIT_FEAT_MV, list, blockn, x_or_y, pred + mvd);
++        mvd = clamp_mvd(mv - pred);
++    }
++
++    if ( h->ffe.out_active && mvd != orig )
++        record_edit(fsl, pos, len, mvd);
++
++    if ( (avctx->ffedit_export & (1 << FFEDIT_FEAT_MV)) != 0 )
++    {
++        ffe_mv_export_select(&fsl->mv, f, list, blockn);
++        ffe_mv_set(&fsl->mv, x_or_y, pred + mvd);
++    }
++
++    if ( (avctx->ffedit_export & (1 << FFEDIT_FEAT_MV_DELTA)) != 0 )
++    {
++        ffe_mv_delta_export_select(&fsl->mv_delta, f, list, blockn);
++        ffe_mv_delta_set(&fsl->mv_delta, x_or_y, mvd);
++    }
++
++    return mvd;
++}
++
++/*-------------------------------------------------------------------*/
++void ffe_h264_uninit(H264Context *h)
++{
++    for ( int i = 0; i < h->nb_slice_ctx; i++ )
++    {
++        FFEditH264SliceContext *fsl = &h->slice_ctx[i].ffe;
++        av_freep(&fsl->edits);
++        fsl->edits_alloc = 0;
++        fsl->nb_edits = 0;
++    }
++    av_freep(&h->ffe.out);
++    h->ffe.out_alloc = 0;
++    h->ffe.out_size = 0;
++}
+diff --git a/libavcodec/ffedit_h264.h b/libavcodec/ffedit_h264.h
+new file mode 100644
+index 0000000..259a890
+--- /dev/null
++++ b/libavcodec/ffedit_h264.h
+@@ -0,0 +1,112 @@
++/*
++ * Copyright (c) 2026 Riposte Laboratories
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#ifndef AVCODEC_FFEDIT_H264_H
++#define AVCODEC_FFEDIT_H264_H
++
++#include <stdint.h>
++
++#include "avcodec.h"
++#include "packet.h"
++#include "ffedit_mv.h"
++#include "h2645_parse.h"
++
++struct H264Context;
++struct H264SliceContext;
++
++/*
++ * FFedit for H.264 (CAVLC, progressive frames only).
++ *
++ * The decoder parses each slice NAL from its RBSP (emulation
++ * prevention bytes already stripped).  Instead of mirroring every
++ * bit read into a PutBitContext (the MPEG-4 approach), we only note
++ * where each mvd se(v) code sits and what it should become:
++ *
++ *   RBSP:  | slice header | ... | mvd | ... | mvd | ... | stop bit |
++ *                                 ^pos,len       ^pos,len
++ *
++ * After the slice is decoded the NAL is rebuilt: bits between the
++ * recorded ranges are copied verbatim, the ranges are re-encoded as
++ * se(v), the stop bit and alignment are regenerated, and emulation
++ * prevention bytes are re-inserted.  Unedited NALs are copied raw.
++ */
++
++/* one edited mvd: bit offset (from the NAL header byte) and length
++ * of the original se(v) code, and its replacement value. */
++typedef struct FFEditH264MvdEdit {
++    int pos;
++    int len;
++    int val;
++} FFEditH264MvdEdit;
++
++/* per-slice state (lives in H264SliceContext) */
++typedef struct FFEditH264SliceContext {
++    ffe_mv_mb_ctx mv;
++    ffe_mv_mb_ctx mv_delta;
++
++    FFEditH264MvdEdit *edits;
++    int nb_edits;
++    unsigned edits_alloc;
++} FFEditH264SliceContext;
++
++/* per-decoder state (lives in H264Context) */
++typedef struct FFEditH264Context {
++    /* import: JSON side data handed over by the packet */
++    void *jctx;
++    void *ffedit_sd[32]; // should be at least [FFEDIT_FEAT_LAST]
++
++    /* export: set between frame start and field end */
++    int frame_active;
++
++    /* apply: the packet being rebuilt */
++    const uint8_t *in_buf;
++    size_t in_size;
++    size_t in_pos;      /* input bytes consumed so far */
++    uint8_t *out;
++    size_t out_size;
++    unsigned out_alloc;
++    int out_active;
++    int out_failed;
++} FFEditH264Context;
++
++int  ffe_h264_wants_mv(const AVCodecContext *avctx);
++
++void ffe_h264_packet_start(struct H264Context *h, const AVPacket *avpkt);
++void ffe_h264_packet_end(struct H264Context *h, const AVPacket *avpkt);
++void ffe_h264_nal_done(struct H264Context *h, const H2645NAL *nal);
++
++void ffe_h264_slice_start(struct H264SliceContext *sl);
++void ffe_h264_check_slice(const struct H264Context *h,
++                          const struct H264SliceContext *sl);
++
++void ffe_h264_frame_start(struct H264Context *h);
++void ffe_h264_frame_end(struct H264Context *h);
++
++void ffe_h264_mb_start(struct H264SliceContext *sl);
++int  ffe_h264_mvd(const struct H264Context *h,
++                  struct H264SliceContext *sl,
++                  int list,
++                  int blockn,
++                  int x_or_y,
++                  int pred);
++
++void ffe_h264_uninit(struct H264Context *h);
++
++#endif /* AVCODEC_FFEDIT_H264_H */
+diff --git a/libavcodec/h264_cavlc.c b/libavcodec/h264_cavlc.c
+index 12bf70f..2ca82c2 100644
+--- a/libavcodec/h264_cavlc.c
++++ b/libavcodec/h264_cavlc.c
+@@ -664,6 +664,8 @@ int ff_h264_decode_mb_cavlc(const H264Context *h, H264SliceContext *sl)
+ 
+     mb_xy = sl->mb_xy = sl->mb_x + sl->mb_y*h->mb_stride;
+ 
++    ffe_h264_mb_start(sl);
++
+     ff_tlog(h->avctx, "pic:%d mb:%d/%d\n", h->poc.frame_num, sl->mb_x, sl->mb_y);
+     cbp = 0; /* avoid warning. FIXME: find a solution without slowing
+                 down the code */
+@@ -861,6 +863,7 @@ decode_intra_mb:
+             dct8x8_allowed = get_dct8x8_allowed(h, sl);
+ 
+         for (list = 0; list < sl->list_count; list++) {
++            int ffe_blockn = 0;
+             for(i=0; i<4; i++){
+                 if(IS_DIRECT(sl->sub_mb_type[i])) {
+                     sl->ref_cache[list][ scan8[4*i] ] = sl->ref_cache[list][ scan8[4*i]+1 ];
+@@ -877,8 +880,9 @@ decode_intra_mb:
+                         const int index= 4*i + block_width*j;
+                         int16_t (* mv_cache)[2]= &sl->mv_cache[list][ scan8[index] ];
+                         pred_motion(h, sl, index, block_width, list, sl->ref_cache[list][ scan8[index] ], &mx, &my);
+-                        mx += (unsigned)get_se_golomb(&sl->gb);
+-                        my += (unsigned)get_se_golomb(&sl->gb);
++                        mx += (unsigned)ffe_h264_mvd(h, sl, list, ffe_blockn, 0, mx);
++                        my += (unsigned)ffe_h264_mvd(h, sl, list, ffe_blockn, 1, my);
++                        ffe_blockn++;
+                         ff_tlog(h->avctx, "final mv:%d %d\n", mx, my);
+ 
+                         if(IS_SUB_8X8(sub_mb_type)){
+@@ -931,8 +935,8 @@ decode_intra_mb:
+             for (list = 0; list < sl->list_count; list++) {
+                 if(IS_DIR(mb_type, 0, list)){
+                     pred_motion(h, sl, 0, 4, list, sl->ref_cache[list][ scan8[0] ], &mx, &my);
+-                    mx += (unsigned)get_se_golomb(&sl->gb);
+-                    my += (unsigned)get_se_golomb(&sl->gb);
++                    mx += (unsigned)ffe_h264_mvd(h, sl, list, 0, 0, mx);
++                    my += (unsigned)ffe_h264_mvd(h, sl, list, 0, 1, my);
+                     ff_tlog(h->avctx, "final mv:%d %d\n", mx, my);
+ 
+                     fill_rectangle(sl->mv_cache[list][ scan8[0] ], 4, 4, 8, pack16to32(mx,my), 4);
+@@ -962,12 +966,14 @@ decode_intra_mb:
+                     }
+             }
+             for (list = 0; list < sl->list_count; list++) {
++                int ffe_blockn = 0;
+                 for(i=0; i<2; i++){
+                     unsigned int val;
+                     if(IS_DIR(mb_type, i, list)){
+                         pred_16x8_motion(h, sl, 8*i, list, sl->ref_cache[list][scan8[0] + 16*i], &mx, &my);
+-                        mx += (unsigned)get_se_golomb(&sl->gb);
+-                        my += (unsigned)get_se_golomb(&sl->gb);
++                        mx += (unsigned)ffe_h264_mvd(h, sl, list, ffe_blockn, 0, mx);
++                        my += (unsigned)ffe_h264_mvd(h, sl, list, ffe_blockn, 1, my);
++                        ffe_blockn++;
+                         ff_tlog(h->avctx, "final mv:%d %d\n", mx, my);
+ 
+                         val= pack16to32(mx,my);
+@@ -1000,12 +1006,14 @@ decode_intra_mb:
+                     }
+             }
+             for (list = 0; list < sl->list_count; list++) {
++                int ffe_blockn = 0;
+                 for(i=0; i<2; i++){
+                     unsigned int val;
+                     if(IS_DIR(mb_type, i, list)){
+                         pred_8x16_motion(h, sl, i*4, list, sl->ref_cache[list][ scan8[0] + 2*i ], &mx, &my);
+-                        mx += (unsigned)get_se_golomb(&sl->gb);
+-                        my += (unsigned)get_se_golomb(&sl->gb);
++                        mx += (unsigned)ffe_h264_mvd(h, sl, list, ffe_blockn, 0, mx);
++                        my += (unsigned)ffe_h264_mvd(h, sl, list, ffe_blockn, 1, my);
++                        ffe_blockn++;
+                         ff_tlog(h->avctx, "final mv:%d %d\n", mx, my);
+ 
+                         val= pack16to32(mx,my);
+diff --git a/libavcodec/h264_picture.c b/libavcodec/h264_picture.c
+index 3234141..2c5be80 100644
+--- a/libavcodec/h264_picture.c
++++ b/libavcodec/h264_picture.c
+@@ -193,6 +193,8 @@ int ff_h264_field_end(H264Context *h, H264SliceContext *sl, int in_setup)
+     int err = 0;
+     h->mb_y = 0;
+ 
++    ffe_h264_frame_end(h);
++
+     if (in_setup || !(avctx->active_thread_type & FF_THREAD_FRAME)) {
+         if (!h->droppable) {
+             err = ff_h264_execute_ref_pic_marking(h);
+diff --git a/libavcodec/h264_slice.c b/libavcodec/h264_slice.c
+index e9a404e..b69872c 100644
+--- a/libavcodec/h264_slice.c
++++ b/libavcodec/h264_slice.c
+@@ -1604,6 +1604,7 @@ static int h264_field_start(H264Context *h, const H264SliceContext *sl,
+             h->first_field = 0;
+             return AVERROR_INVALIDDATA;
+         }
++        ffe_h264_frame_start(h);
+     } else {
+         int field = h->picture_structure == PICT_BOTTOM_FIELD;
+         release_unused_pictures(h, 0);
+@@ -2056,10 +2057,12 @@ int ff_h264_queue_decode_slice(H264Context *h, const H2645NAL *nal)
+     int ret;
+ 
+     sl->gb = nal->gb;
++    ffe_h264_slice_start(sl);
+ 
+     ret = h264_slice_header_parse(h, sl, nal);
+     if (ret < 0)
+         return ret;
++    ffe_h264_check_slice(h, sl);
+ 
+     // discard redundant pictures
+     if (sl->redundant_pic_count > 0) {
+diff --git a/libavcodec/h264dec.c b/libavcodec/h264dec.c
+index b4973fc..9dac5b8 100644
+--- a/libavcodec/h264dec.c
++++ b/libavcodec/h264dec.c
+@@ -353,6 +353,7 @@ static av_cold int h264_decode_end(AVCodecContext *avctx)
+     H264Context *h = avctx->priv_data;
+     int i;
+ 
++    ffe_h264_uninit(h);
+     ff_h264_remove_all_refs(h);
+     ff_h264_free_tables(h);
+ 
+@@ -744,6 +745,8 @@ static int decode_nal_units(H264Context *h, const uint8_t *buf, int buf_size)
+         if (err < 0) {
+             av_log(h->avctx, AV_LOG_ERROR, "decode_slice_header error\n");
+         }
++
++        ffe_h264_nal_done(h, nal);
+     }
+ 
+     ret = ff_h264_execute_decode_slices(h);
+@@ -1022,8 +1025,8 @@ static int send_next_delayed_frame(H264Context *h, AVFrame *dst_frame,
+     return buf_index;
+ }
+ 
+-static int h264_decode_frame(AVCodecContext *avctx, AVFrame *pict,
+-                             int *got_frame, AVPacket *avpkt)
++static int h264_decode_frame_internal(AVCodecContext *avctx, AVFrame *pict,
++                                      int *got_frame, AVPacket *avpkt)
+ {
+     const uint8_t *buf = avpkt->data;
+     int buf_size       = avpkt->size;
+@@ -1092,6 +1095,24 @@ static int h264_decode_frame(AVCodecContext *avctx, AVFrame *pict,
+     return get_consumed_bytes(buf_index, buf_size);
+ }
+ 
++/* ffedit: every non-empty packet yields one output packet, rebuilt
++ * NAL by NAL in decode_nal_units() */
++static int h264_decode_frame(AVCodecContext *avctx, AVFrame *pict,
++                             int *got_frame, AVPacket *avpkt)
++{
++    H264Context *h = avctx->priv_data;
++    int ret;
++
++    if (avpkt->size == 0)
++        return h264_decode_frame_internal(avctx, pict, got_frame, avpkt);
++
++    ffe_h264_packet_start(h, avpkt);
++    ret = h264_decode_frame_internal(avctx, pict, got_frame, avpkt);
++    ffe_h264_packet_end(h, avpkt);
++
++    return ret;
++}
++
+ #define OFFSET(x) offsetof(H264Context, x)
+ #define VD AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_DECODING_PARAM
+ #define VDX VD | AV_OPT_FLAG_EXPORT
+diff --git a/libavcodec/h264dec.h b/libavcodec/h264dec.h
+index 447c249..1f5a08a 100644
+--- a/libavcodec/h264dec.h
++++ b/libavcodec/h264dec.h
+@@ -45,6 +45,7 @@
+ #include "mpegutils.h"
+ #include "threadframe.h"
+ #include "videodsp.h"
++#include "ffedit_h264.h"
+ 
+ #define H264_MAX_PICTURE_COUNT 36
+ 
+@@ -324,6 +325,9 @@ typedef struct H264SliceContext {
+     int delta_poc[2];
+     int curr_pic_num;
+     int max_pic_num;
++
++    /* ffedit */
++    FFEditH264SliceContext ffe;
+ } H264SliceContext;
+ 
+ /**
+@@ -573,6 +577,9 @@ typedef struct H264Context {
+     int non_gray;                       ///< Did we encounter a intra frame after a gray gap frame
+     int noref_gray;
+     int skip_gray;
++
++    /* ffedit */
++    FFEditH264Context ffe;
+ } H264Context;
+ 
+ extern const uint16_t ff_h264_mb_sizes[4];
+-- 
+2.55.0
+

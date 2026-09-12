@@ -23,29 +23,36 @@ jobs:
       - run: pytest tests/test_transform.py tests/test_crypto.py tests/test_stream.py tests/test_pubkey.py -v
 
   integration:
-    # The real proof: byte-exact round trips through actual MPEG-2 and MPEG-4
-    # bitstreams, using the FFglitch binaries.
+    # The real proof: byte-exact round trips through actual MPEG-2, MPEG-4
+    # and H.264 bitstreams, using the FFglitch binaries.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: install FFglitch
+      - name: install FFglitch (patched for H.264, static build)
+        # Built by ffglitch/build.sh with STATIC=1 and published as a release
+        # asset on this repo. Static because a binary built on Arch wants a
+        # newer glibc than this runner image has; a release asset because a
+        # from-source build takes longer than the rest of the job. The stock
+        # ffglitch.org zip would make the H.264 tests skip, and the no-skip
+        # rule below would then fail the job, which is the right outcome.
+        env:
+          API: ${{ github.server_url }}/api/v1/repos/${{ github.repository }}
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # The prebuilt FFglitch binaries link against SDL2 (ffplay is in the
-          # same bundle). Without it every binary dies with
-          #   ffedit: error while loading shared libraries: libSDL2-2.0.so.0
-          # and exits 127, which surfaces much later as dozens of confusing
-          # CalledProcessError(127) in the tests rather than as an install
-          # failure.
+          # H.264 carriers are made by the system ffmpeg (libx264); ffgac has
+          # no H.264 encoder.
           sudo apt-get update -qq
-          sudo apt-get install -y -qq libsdl2-2.0-0
-          curl -sSL -o ffglitch.zip \
-            https://ffglitch.org/pub/bin/linux64/ffglitch-0.10.2-linux-x86_64.zip
-          unzip -q ffglitch.zip -d /opt
-          mv /opt/ffglitch-0.10.2-linux-x86_64 /opt/ffglitch
-          chmod +x /opt/ffglitch/*
+          sudo apt-get install -y -qq ffmpeg
+          url=$(curl -sSf -H "Authorization: token $TOKEN" \
+            "$API/releases/tags/ffglitch-h264-1" \
+            | python3 -c 'import sys,json; print(json.load(sys.stdin)["assets"][0]["browser_download_url"])')
+          curl -sSfL -H "Authorization: token $TOKEN" -o ffglitch.tar.xz "$url"
+          echo "aba051a3759cc6366c3da2c88cbeb01dfb95feca47162aba2d729b8dc792c4f1  ffglitch.tar.xz" | sha256sum -c
+          sudo tar -xJf ffglitch.tar.xz -C /opt
+          sudo mv /opt/ffglitch-0.10.2-h264 /opt/ffglitch
           echo "/opt/ffglitch" >> "$GITHUB_PATH"
       # No pipe here. `ffedit -version | head -1` reports head's exit status,
       # so a completely non-functional ffedit passed this check silently and
