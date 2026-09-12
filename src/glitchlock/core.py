@@ -26,7 +26,7 @@ import tempfile
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Sequence
 
-from . import ffg
+from . import ffg, mp2
 from .crypto import sha256_file
 from .domains import CODEC_FEATURES, REJECTED_FEATURES, SUPPORTED_FEATURES
 from .manifest import Layer, Manifest
@@ -83,8 +83,20 @@ class LockResult:
     selftest_ok: Optional[bool]
 
 
+def _refuse_other_layers(layer: Optional[str]) -> None:
+    if layer is not None and layer != mp2.LAYER_NAMES[mp2.LAYER_II]:
+        raise LockError(
+            f"MPEG audio {layer} is not supported: only Layer II (MP2) has the "
+            "fixed-width fields the transform needs. Layer III and AAC are "
+            "entropy coded; Layer I is untested. Transcode with "
+            "'ffmpeg -i in -c:a mp2 out.mp2'."
+        )
+
+
 def lockable_features(path: str) -> List[str]:
     """Features that are both exposed by FFedit and verified for this codec."""
+    if mp2.is_mp2(path):
+        return list(mp2.FEATURES)
     available = ffg.supported_features(path)
     codec = ffg.codec_name(path)
     verified = CODEC_FEATURES.get(codec, ())
@@ -93,6 +105,10 @@ def lockable_features(path: str) -> List[str]:
 
 def select_features(path: str, requested: Optional[Sequence[str]]) -> List[str]:
     """Resolve the feature list for *path*, validating against FFedit and codec."""
+    layer = mp2.sniff_file(path)
+    _refuse_other_layers(layer)
+    if layer is not None:
+        return _select_audio_features(requested)
     available = ffg.supported_features(path)
     codec = ffg.codec_name(path)
     verified = CODEC_FEATURES.get(codec)
@@ -136,6 +152,56 @@ def select_features(path: str, requested: Optional[Sequence[str]]) -> List[str]:
             "Run 'glitchlock prepare' to build a glitchable carrier first."
         )
     return chosen
+
+
+def _select_audio_features(requested: Optional[Sequence[str]]) -> List[str]:
+    if not requested:
+        return list(mp2.FEATURES)
+    for feature in requested:
+        if feature not in mp2.FEATURES:
+            raise LockError(
+                f"feature {feature!r} is not an MP2 feature; MP2 offers "
+                f"{', '.join(mp2.FEATURES)}"
+            )
+    return list(requested)
+
+
+def _run_audio(
+    src: str,
+    dst: str,
+    layers: Sequence[mp2.LayerSpec],
+    key: bytes,
+    nonce: bytes,
+    forward: bool,
+    segment: int = 0,
+) -> List[Layer]:
+    """Transform every MP2 frame of *src* into *dst* in one pass.
+
+    The audio layers touch disjoint fields, so applying them together is the
+    same as the video path's one-layer-at-a-time composition. No repairs are
+    possible: the writer is the parser run backwards, and a value that does
+    not survive it would have failed the range check before it was touched.
+    """
+    with open(src, "rb") as fh:
+        data = fh.read()
+    try:
+        out, stats = mp2.transform_stream(data, key, nonce, layers, forward, segment)
+    except mp2.Mp2Error as exc:
+        raise LockError(str(exc)) from exc
+    with open(dst, "wb") as fh:
+        fh.write(out)
+    return [
+        Layer(
+            feature=feature,
+            mode=mode,
+            intensity=intensity,
+            frames=stats[feature].frames,
+            slots_total=stats[feature].slots_total,
+            slots_touched=stats[feature].slots_touched,
+            buckets=stats[feature].buckets,
+        )
+        for feature, mode, intensity in layers
+    ]
 
 
 def _run_layer(
@@ -214,9 +280,10 @@ def lock(
     segment: int = 0,
     allow_noop: bool = False,
 ) -> LockResult:
+    audio = mp2.is_mp2(carrier)
     manifest = Manifest(
-        ffglitch=ffg.version(),
-        codec=ffg.codec_name(carrier),
+        ffglitch="" if audio else ffg.version(),
+        codec=mp2.CODEC_NAME if audio else ffg.codec_name(carrier),
         nonce=nonce.hex(),
         segment=segment,
         carrier_sha256=sha256_file(carrier),
@@ -226,6 +293,18 @@ def lock(
     workroot = tempfile.mkdtemp(prefix="glitchlock-lock-")
     try:
         current = carrier
+        if audio:
+            report(f"  locking MP2 layers: {', '.join(features)}")
+            specs = [(feature, mode, intensity) for feature in features]
+            manifest.layers.extend(_run_audio(
+                carrier, out_path, specs, key, nonce, forward=True, segment=segment,
+            ))
+            for layer in manifest.layers:
+                report(
+                    f"    {layer.feature}: {layer.slots_touched}/{layer.slots_total} "
+                    f"slots across {layer.frames} frames"
+                )
+            features = ()
         for index, feature in enumerate(features):
             is_last = index == len(features) - 1
             dst = out_path if is_last else os.path.join(workroot, f"stage{index}.bin")
@@ -320,6 +399,13 @@ def unlock(
         return out_path
 
     nonce = bytes.fromhex(manifest.nonce)
+    if manifest.codec == mp2.CODEC_NAME:
+        report(f"  unlocking MP2 layers: {', '.join(l.feature for l in layers)}")
+        specs = [(l.feature, l.mode, l.intensity) for l in layers]
+        _run_audio(locked, out_path, specs, key, nonce, forward=False,
+                   segment=manifest.segment)
+        return out_path
+
     workroot = tempfile.mkdtemp(prefix="glitchlock-unlock-")
     try:
         current = locked
