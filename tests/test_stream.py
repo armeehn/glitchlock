@@ -4,6 +4,7 @@ The splitter tests are pure and always run. The round trip needs FFglitch and
 skips without it.
 """
 
+import io
 import subprocess
 
 import pytest
@@ -13,6 +14,10 @@ from glitchlock.core import lock, select_features, unlock
 from glitchlock.crypto import sha256_file
 from glitchlock.stream import (
     SEQUENCE_HEADER,
+    VOS_HEADER,
+    StreamSession,
+    run_stream,
+    sniff_codec,
     SegmentReader,
     segment_offsets,
     split_segments,
@@ -221,3 +226,65 @@ def test_ffedit_works_through_pipes(stream_carrier, tmp_path):
     piped = tmp_path / "piped.mpg"
     piped.write_bytes(out.stdout)
     assert sha256_file(str(piped)) == sha256_file(stream_carrier)
+
+
+# ------------------------------------------------------------------ pipeline
+
+
+def test_sniff_picks_the_first_marker():
+    assert sniff_codec(b"junk" + VOS_HEADER + SEQUENCE_HEADER) == "mpeg4"
+    assert sniff_codec(SEQUENCE_HEADER + VOS_HEADER) == "mpeg2video"
+    with pytest.raises(ValueError):
+        sniff_codec(b"no start codes at all")
+
+
+def test_session_round_trips_through_json(tmp_path):
+    s = StreamSession(codec="mpeg4", nonce=NONCE.hex(), features=["mv"], gops=3)
+    p = tmp_path / "s.json"
+    s.save(str(p))
+    assert StreamSession.load(str(p)) == s
+    m = s.manifest_for(7)
+    assert (m.segment, m.nonce, [l.feature for l in m.layers]) == (7, NONCE.hex(), ["mv"])
+
+
+@needs_ffglitch
+@pytest.mark.parametrize("gops,workers", [(1, 1), (3, 4)])
+def test_pipeline_roundtrip_is_byte_exact(stream_carrier, gops, workers):
+    """cat carrier | stream-lock | stream-unlock == carrier, whatever the
+    grouping or concurrency."""
+    original = open(stream_carrier, "rb").read()
+    session = StreamSession(codec="", nonce=NONCE.hex(), features=["mv"], gops=gops)
+
+    locked = io.BytesIO()
+    stats = run_stream(io.BytesIO(original), locked, session, KEY,
+                       forward=True, workers=workers, block=1000)
+    assert session.codec == "mpeg2video"
+    assert stats.segments == -(-len(split_segments(original)) // gops)
+    assert locked.getvalue() != original
+
+    restored = io.BytesIO()
+    run_stream(io.BytesIO(locked.getvalue()), restored, session, KEY,
+               forward=False, workers=workers, block=1000)
+    assert restored.getvalue() == original
+
+
+@needs_ffglitch
+def test_pipeline_output_keeps_segment_order(stream_carrier):
+    """With many workers the pool finishes out of order; the stream must not."""
+    original = open(stream_carrier, "rb").read()
+    session = StreamSession(codec="", nonce=NONCE.hex(), features=["mv"])
+    piped = io.BytesIO()
+    run_stream(io.BytesIO(original), piped, session, KEY, forward=True, workers=8)
+
+    # each single-segment run numbers its piece first_segment, so renumber
+    session_n = [StreamSession(codec="", nonce=NONCE.hex(), features=["mv"],
+                               first_segment=n) for n in range(1, len(split_segments(original)) + 1)]
+    expected = b"".join(
+        _lock_alone(seg, s, KEY) for seg, s in zip(split_segments(original), session_n))
+    assert piped.getvalue() == expected
+
+
+def _lock_alone(seg, session, key):
+    buf = io.BytesIO()
+    run_stream(io.BytesIO(seg), buf, session, key, forward=True, workers=1)
+    return buf.getvalue()

@@ -203,6 +203,20 @@ can synthesise its manifest from session parameters — so nothing has to be sen
 alongside the video. Latency is one GOP (480 ms at GOP 12/25 fps). 720p keeps up
 with a live feed on 4 cores; 1080p needs more.
 
+`stream-lock` and `stream-unlock` do this over pipes, so the sender and the
+receiver are one command each. The receiver needs the key and a small session
+record (nonce, codec, features, first segment number); no manifest travels:
+
+```console
+$ glitchlock prepare live.mkv -o carrier.m4v --codec mpeg4 --closed-gop
+$ glitchlock stream-lock -i carrier.m4v --key-file key.bin --session s.json --gops 5 | nc host 9000
+$ nc -l 9000 | glitchlock stream-unlock --session s.json --key-file key.bin | ffplay -f m4v -
+```
+
+Segments are locked by a worker pool but written strictly in order, and at
+most twice `--workers` are in flight, so memory stays bounded. A stream that
+ends inside a GOP fails on its last piece only; everything before it is out.
+
 See [docs/pdf/streaming.pdf](docs/pdf/streaming.pdf) for the measurements and for what is still
 missing — there is no TS/HLS wrapping, no audio path and no daemon yet.
 

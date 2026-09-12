@@ -23,6 +23,7 @@ from .crypto import (
 )
 from .domains import REJECTED_FEATURES, SUPPORTED_FEATURES
 from .manifest import Manifest
+from .stream import StreamSession, run_stream
 from .transform import MODES
 
 
@@ -256,6 +257,63 @@ def cmd_unlock(args) -> int:
     return 0
 
 
+# ------------------------------------------------------------------ streaming
+
+
+def _open_stream(path: Optional[str], mode: str):
+    """``-`` or nothing means the process's own stdin/stdout, in binary."""
+    if not path or path == "-":
+        return sys.stdin.buffer if "r" in mode else sys.stdout.buffer
+    return open(path, mode)
+
+
+def cmd_stream_lock(args) -> int:
+    features = args.features.split(",") if args.features else ["mv"]
+    key, kdf, keyless, _seed, kem = _resolve_key_for_lock(args)
+    if keyless or kem:
+        _err("stream mode takes a key file or passphrase only")
+        return 2
+
+    session = StreamSession(
+        codec="", nonce=random_nonce().hex(), features=features,
+        mode=args.mode, intensity=args.intensity, gops=args.gops, kdf=kdf,
+    )
+    with _open_stream(args.input, "rb") as src, _open_stream(args.output, "wb") as dst:
+        stats = run_stream(src, dst, session, key, forward=True,
+                           workers=args.workers, report=_report if args.verbose else _noop)
+    session.save(args.session)
+
+    _report(f"locked {stats.segments} segments, {stats.frames} frames, "
+            f"{stats.slots_touched} slots, {stats.bytes_in} -> {stats.bytes_out} bytes")
+    _report(f"session: {args.session}  (needed by the receiver, holds no key)")
+    return 0
+
+
+def cmd_stream_unlock(args) -> int:
+    session = StreamSession.load(args.session)
+    key = _resolve_key_for_unlock(args, session.manifest_for(session.first_segment))
+
+    with _open_stream(args.input, "rb") as src, _open_stream(args.output, "wb") as dst:
+        stats = run_stream(src, dst, session, key, forward=False,
+                           workers=args.workers, report=_report if args.verbose else _noop)
+    _report(f"unlocked {stats.segments} segments, {stats.bytes_in} -> {stats.bytes_out} bytes")
+    return 0
+
+
+def _noop(_msg: str) -> None:
+    pass
+
+
+def _add_stream_io(p) -> None:
+    p.add_argument("-i", "--input", default="-", help="elementary stream, or - for stdin")
+    p.add_argument("-o", "--output", default="-", help="destination, or - for stdout")
+    p.add_argument("--workers", type=int, default=4,
+                   help="segments locked concurrently; output order is preserved")
+    p.add_argument("--verbose", action="store_true", help="report every segment on stderr")
+    p.add_argument("--key-file")
+    p.add_argument("--password")
+
+
 def _verify_once(args, features, key, nonce, workdir):
     """One lock+unlock round trip. Returns (verdict, touched, repairs)."""
     import hashlib
@@ -415,6 +473,24 @@ def build_parser() -> argparse.ArgumentParser:
                    help="private identity file, for a file locked to public keys")
     add_key_args(p)
     p.set_defaults(func=cmd_unlock)
+
+    p = sub.add_parser("stream-lock",
+                       help="lock a closed-GOP elementary stream segment by segment")
+    _add_stream_io(p)
+    p.add_argument("--session", required=True,
+                   help="where to write the session record the receiver needs")
+    p.add_argument("--features", help="comma separated; default: mv")
+    p.add_argument("--mode", choices=MODES, default="full")
+    p.add_argument("--intensity", type=float, default=1.0)
+    p.add_argument("--gops", type=int, default=1,
+                   help="GOPs per segment; more = less overhead, more latency")
+    p.set_defaults(func=cmd_stream_lock, recipient=None, keyless=False)
+
+    p = sub.add_parser("stream-unlock",
+                       help="restore a locked stream from its session record")
+    _add_stream_io(p)
+    p.add_argument("--session", required=True, help="record written by stream-lock")
+    p.set_defaults(func=cmd_stream_unlock, identity=None)
 
     p = sub.add_parser("verify", help="lock+unlock in a scratch dir and report exactness")
     p.add_argument("input")
