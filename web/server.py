@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""glitchlock.hq - web front end for the glitchlock CLI.
+"""Web front end for the glitchlock CLI.
 
 Deliberately stdlib-only, in the same spirit as the tool it wraps. Uploads
 arrive as raw request bodies rather than multipart forms, so there is no form
 parser to get wrong and no dependency to install.
 
-Sits behind Caddy + Authelia, so it carries no auth of its own. It must never be
-bound anywhere the proxy is not in front of it.
+Sits behind an authenticating reverse proxy, so it carries no auth of its own.
+It must never be bound anywhere the proxy is not in front of it.
 """
 
 from __future__ import annotations

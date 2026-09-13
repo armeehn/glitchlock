@@ -88,12 +88,18 @@ offered. See [docs/pdf/design.pdf](docs/pdf/design.pdf) for the full evidence.
 ## Install
 
 You need FFglitch's binaries (`ffedit`, `ffgac`) on your `PATH`. Grab them from
-<https://ffglitch.org/download/> — no build required.
+<https://ffglitch.org/download/> — no build required for MPEG-1/2/4 carriers.
 
 ```console
 $ pip install git+https://github.com/armeehn/glitchlock
 $ glitchlock inspect some.mpg
 ```
+
+H.264 and HEVC carriers need the patched `ffedit` from [ffglitch/](ffglitch/):
+either build it (`ffglitch/build.sh`, a few minutes, needs gcc and make) or
+take the static Linux x86-64 build attached to the `ffglitch-hevc-1` release
+of this repo, which is what CI runs. The core is stdlib-only; `--recipient`
+needs `pip install "glitchlock[recipients]"`.
 
 If FFglitch lives somewhere unusual, point at it with
 `GLITCHLOCK_FFGLITCH_HOME=/opt/ffglitch`.
@@ -381,19 +387,22 @@ Pass `--allow-noop` if you genuinely want a copy.
 
 ## Status
 
-Verified on FFglitch 0.10.2, MPEG-2 and MPEG-4 part 2, and on MP2 audio
-against ffmpeg 8.1. 247 tests pass, including byte-exact round trips through
-real bitstreams for every mode, both video codecs, B-frames, 4MV, qpel, a
-chunked stream, and 20 MP2 fixtures across rates, bitrates, modes and CRC. Beyond the suite, a
-900-configuration sweep across 18 source clips (odd dimensions, 16x16, single
-frame, 60 fps, greyscale, pure noise, 720p) round-tripped byte-exact in every
-case that scrambled anything at all.
+Verified on FFglitch 0.10.2 for MPEG-2, MPEG-4 part 2, H.264 (CAVLC) and
+HEVC, and on MP2 audio against ffmpeg 8.1. 259 tests pass, including
+byte-exact round trips through real bitstreams for every mode, all four video
+codecs, B-frames, 4MV, qpel, a chunked stream, and 20 MP2 fixtures across
+rates, bitrates, modes and CRC. Beyond the suite, a 900-configuration MPEG
+sweep across 18 source clips (odd dimensions, 16x16, single frame, 60 fps,
+greyscale, pure noise, 720p) and a 20-configuration x265 sweep (CTB 16/32/64,
+B-pyramid, AMP, weighted prediction, lossless CUs, Main 10, 720p) round-tripped
+byte-exact in every case that scrambled anything at all.
 
-**Only mpeg1video, mpeg2video and mpeg4 are actually lockable.** The domain
-table also lists H.263, MSMPEG-4 v1–v3, WMV1/2 and FLV1 because their motion
-vector geometry is known, but FFglitch 0.10.2 exposes no editable features for
-any of them — `ffedit -i` lists nothing, so there is nothing to scramble. They
-are kept in the table against a future FFglitch that does expose them.
+**Lockable: mpeg1video, mpeg2video and mpeg4 with stock FFglitch; h264 and
+hevc with the patched build.** The domain table also lists H.263, MSMPEG-4
+v1–v3, WMV1/2 and FLV1 because their motion vector geometry is known, but
+FFglitch 0.10.2 exposes no editable features for any of them — `ffedit -i`
+lists nothing, so there is nothing to scramble. They are kept in the table
+against a future FFglitch that does expose them.
 
 ## Is this encryption?
 
@@ -408,4 +417,7 @@ or GPG.
 ## License
 
 MIT — see [LICENSE](LICENSE). FFglitch itself is GPL and is used here as an
-external binary, not linked.
+external binary, not linked. The patches under [ffglitch/](ffglitch/) modify
+FFmpeg code and stay under FFmpeg's LGPL-2.1+; binaries built from them with
+`build.sh` (including the release asset CI uses) are GPL-2.0+, and their source
+is the FFglitch 0.10.2 tarball plus those patches.

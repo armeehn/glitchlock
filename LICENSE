@@ -1,6 +1,6 @@
 MIT License
 
-Copyright (c) 2026 Andrew Rady
+Copyright (c) 2026 Sasha Zero
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -24,4 +24,12 @@ SOFTWARE.
 
 glitchlock invokes the FFglitch binaries (ffedit, ffgac) as external programs.
 FFglitch is Copyright (C) 2018-2024 Ramiro Polla and is licensed under the GPL.
-It is not distributed with, linked into, or derived from this project.
+It is not linked into this project.
+
+The MIT grant above covers the Python package, the web front end, the tests
+and the documents. It does not cover ffglitch/: the patches there modify
+FFglitch, which is FFmpeg, and each patched file keeps FFmpeg's LGPL-2.1+
+header. Binaries produced by ffglitch/build.sh are configured with
+--enable-gpl and are therefore GPL-2.0+; their complete corresponding source
+is the ffglitch-0.10.2 tarball from ffglitch.org plus the patches in that
+directory, in the order build.sh applies them.

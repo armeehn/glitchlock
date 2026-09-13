@@ -43,7 +43,7 @@ Point 3 is the one that quietly kills most candidate features.
 
 \ripsection{\ripmdhead{2. Plaintext is the carrier, not your source file}}
 
-\ripmono{glitchlock prepare} transcodes arbitrary input into an MPEG-2 or MPEG-4 elementary stream. That step is an ordinary lossy transcode and it drops audio.
+\ripmono{glitchlock prepare} transcodes arbitrary input into an MPEG-2, MPEG-4, H.264 or HEVC elementary stream. That step is an ordinary lossy transcode and it drops audio.
 
 Everything downstream is bit-exact, and the carrier is what the manifest's \ripmono{carrier\_\allowbreak{}sha256} commits to. This boundary is deliberate and stated plainly rather than blurred: glitchlock does not claim to give you back your original H.264 file, because it cannot.
 
@@ -217,7 +217,7 @@ The locked file grows because scrambled vectors are less predictable and cost mo
 
 \begin{ripbullets}
 \item \ripmono{prepare} is lossy and drops audio; the carrier is the plaintext.
-\item Only MPEG-2 and MPEG-4 part 2 are round-trip tested. Other codecs in the domain table share MPEG-4's geometry but are untested here — \ripmono{verify} will tell you before you trust one.
+\item MPEG-2, MPEG-4 part 2, H.264 (CAVLC, patched FFglitch), HEVC (CABAC re-encoded, patched FFglitch) and MP2 audio are round-trip tested. Other codecs in the domain table share MPEG-4's geometry but are untested here — \ripmono{verify} will tell you before you trust one.
 \item The locked file is larger than the carrier.
 \item Reversibility is tied to FFglitch's behaviour. A future release that changes MV export semantics would be caught by the self-test, which is exactly why the self-test runs by default.
 \end{ripbullets}

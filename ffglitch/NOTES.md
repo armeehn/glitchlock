@@ -124,7 +124,7 @@ a message when an mv feature is requested on: CABAC
 or a decoder with more than one slice context. A plain `-o` copy of
 such files still works.
 
-## Verified (2026-09-12, LXC 111, gcc 16)
+## Verified (2026-09-12, Arch Linux build host, gcc 16)
 
 `mvtest.py` replaces every slot with random values in [-64, 64] and
 checks: (a) `ffmpeg -v error -i edited.264 -f null -` prints nothing
@@ -173,7 +173,7 @@ CABAC refusal (`cabac.264`, High profile):
   (~1 s per 720 frames of 960x720 per pass here).
 * Frame threading is off (ffedit forces slice threading, default one
   thread); the hooks assume `nb_slice_ctx == 1` and refuse otherwise.
-* Built with `--disable-x86asm --disable-libxvid` because LXC 111 has
+* Built with `--disable-x86asm --disable-libxvid` because the build host has
   no nasm; the bundled Xvid encoder (used by ffgac's libxvid) is
   therefore absent from this build. Everything else matches the
   upstream 0.10.2 configuration minus SDL/xcb/drm (fflive not built).
@@ -225,7 +225,7 @@ gives back the original file.
 Unedited slices are copied raw, so cabac_zero_words or non-canonical
 escapes in the source only matter for slices that were edited.
 
-### Verified (2026-09-13, LXC 111, x265 4.2)
+### Verified (2026-09-13, Arch Linux build host, x265 4.2)
 
 `rt.py`-style round trip on 20 encoder configurations: edit every
 vector to a random value, apply, re-export (all vectors identical),
