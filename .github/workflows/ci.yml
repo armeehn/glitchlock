@@ -31,28 +31,28 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: install FFglitch (patched for H.264, static build)
+      - name: install FFglitch (patched for H.264 and HEVC, static build)
         # Built by ffglitch/build.sh with STATIC=1 and published as a release
         # asset on this repo. Static because a binary built on Arch wants a
         # newer glibc than this runner image has; a release asset because a
         # from-source build takes longer than the rest of the job. The stock
-        # ffglitch.org zip would make the H.264 tests skip, and the no-skip
+        # ffglitch.org zip would make the H.264/HEVC tests skip, and the no-skip
         # rule below would then fail the job, which is the right outcome.
         env:
           API: ${{ github.server_url }}/api/v1/repos/${{ github.repository }}
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # H.264 carriers are made by the system ffmpeg (libx264); ffgac has
-          # no H.264 encoder.
+          # H.264 and HEVC carriers are made by the system ffmpeg (libx264,
+          # libx265); ffgac has neither encoder.
           sudo apt-get update -qq
           sudo apt-get install -y -qq ffmpeg
           url=$(curl -sSf -H "Authorization: token $TOKEN" \
-            "$API/releases/tags/ffglitch-h264-1" \
+            "$API/releases/tags/ffglitch-hevc-1" \
             | python3 -c 'import sys,json; print(json.load(sys.stdin)["assets"][0]["browser_download_url"])')
           curl -sSfL -H "Authorization: token $TOKEN" -o ffglitch.tar.xz "$url"
-          echo "aba051a3759cc6366c3da2c88cbeb01dfb95feca47162aba2d729b8dc792c4f1  ffglitch.tar.xz" | sha256sum -c
+          echo "c49eb7e34f299b0e043c26a813de2009fcd05471d2117a02e80717a9bf9208a9  ffglitch.tar.xz" | sha256sum -c
           sudo tar -xJf ffglitch.tar.xz -C /opt
-          sudo mv /opt/ffglitch-0.10.2-h264 /opt/ffglitch
+          sudo mv /opt/ffglitch-0.10.2-hevc /opt/ffglitch
           echo "/opt/ffglitch" >> "$GITHUB_PATH"
       # No pipe here. `ffedit -version | head -1` reports head's exit status,
       # so a completely non-functional ffedit passed this check silently and

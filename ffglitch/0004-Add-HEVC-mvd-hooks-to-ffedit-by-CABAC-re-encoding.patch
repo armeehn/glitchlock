@@ -1,0 +1,1601 @@
+From 854e58b5f90b8eae5735b1c96ff67d57849109b4 Mon Sep 17 00:00:00 2001
+From: Sasha Zero <sasha@ripostelabs.xyz>
+Date: Sun, 13 Sep 2026 14:33:20 -0700
+Subject: [PATCH] Add HEVC mvd hooks to ffedit by CABAC re-encoding
+
+Export and re-apply every coded mvd of P and B prediction units as
+the "mv" (final vector, mvp + mvd) and "mv_delta" (raw mvd) features.
+
+HEVC slice data is CABAC only, so nothing can be rewritten in place:
+the arithmetic coder state after an edited value differs and every
+following bit changes. Instead every bin the decoder reads is logged
+with its context (or bypass/terminate), the bins of an edited mvd
+group are replaced by the binarisation of the new value, and the
+slice is re-encoded from the logged bins with a CABAC encoder started
+from the slice's initial context states. Context selection never
+depends on an mvd value and the group is contiguous, so nothing else
+moves. The slice header is copied, rbsp_slice_segment_trailing_bits
+are regenerated and emulation prevention is re-inserted. NALs without
+edits are copied raw.
+
+Applying the exported JSON back onto an edited stream reproduces the
+x265 original byte for byte (tested on 20 encoder configurations,
+Main and Main 10, CTB 16/32/64, B-pyramid, AMP, weighted prediction,
+lossless CUs, transform skip, 1280x720). Refused with a clear message
+when an mv feature is requested: WPP, tiles, dependent slice segments,
+PCM, CABAC bypass alignment, hvcC input, more than one thread.
+
+MAX_MV2DARRAY_NBLOCKS grows to 128: a 64x64 CTB holds up to 128
+inter PUs per list.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ libavcodec/Makefile      |   1 +
+ libavcodec/ffedit_hevc.c | 887 +++++++++++++++++++++++++++++++++++++++
+ libavcodec/ffedit_hevc.h | 173 ++++++++
+ libavcodec/hevc_cabac.c  |  73 ++--
+ libavcodec/hevcdec.c     |  46 +-
+ libavcodec/hevcdec.h     |   7 +
+ libavformat/hevcdec.c    |   3 +-
+ libavutil/json.h         |   2 +-
+ 8 files changed, 1152 insertions(+), 40 deletions(-)
+ create mode 100644 libavcodec/ffedit_hevc.c
+ create mode 100644 libavcodec/ffedit_hevc.h
+
+diff --git a/libavcodec/Makefile b/libavcodec/Makefile
+index 40581ca..143a7a5 100644
+--- a/libavcodec/Makefile
++++ b/libavcodec/Makefile
+@@ -437,6 +437,7 @@ OBJS-$(CONFIG_HCOM_DECODER)            += hcom.o
+ OBJS-$(CONFIG_HDR_DECODER)             += hdrdec.o
+ OBJS-$(CONFIG_HDR_ENCODER)             += hdrenc.o
+ OBJS-$(CONFIG_HEVC_DECODER)            += hevcdec.o hevc_mvs.o \
++                                          ffedit_hevc.o \
+                                           hevc_cabac.o hevc_refs.o hevcpred.o    \
+                                           hevcdsp.o hevc_filter.o hevc_data.o \
+                                           h274.o aom_film_grain.o
+diff --git a/libavcodec/ffedit_hevc.c b/libavcodec/ffedit_hevc.c
+new file mode 100644
+index 0000000..413073b
+--- /dev/null
++++ b/libavcodec/ffedit_hevc.c
+@@ -0,0 +1,887 @@
++/*
++ * Copyright (c) 2026 Riposte Laboratories
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#include <stdlib.h>
++#include <string.h>
++
++#include "libavutil/mem.h"
++
++#include "cabac_functions.h"
++#include "ffedit.h"
++#include "ffedit_hevc.h"
++#include "ffedit_json.h"
++#include "ffedit_mv.h"
++#include "get_bits.h"
++#include "hevcdec.h"
++#include "put_bits.h"
++
++/* JSON directions: 0 = list0 ("forward"), 1 = list1 ("backward") */
++#define NB_DIRECTIONS 2
++/* smallest inter PU is 8x4 / 4x8: two per 8x8 CU */
++#define MIN_INTER_CU_LOG2 3
++#define PUS_PER_MIN_CU 2
++
++/* mvd is coded as se(v)-like EG1: the decoder stores it in int16 */
++#define MVD_MIN (-32768)
++#define MVD_MAX ( 32767)
++#define WRAP16(v) ((int) (int16_t) (v))
++
++/* bins of one mvd group: 2 greater0 + 2 greater1 + 2 x (prefix 15 +
++ * stop + suffix 15 + sign) is 68 */
++#define MAX_MVD_BINS 80
++/* abs_mvd_minus2 is EG1: first suffix length */
++#define MVD_EG_K 1
++
++/* CABAC encoder registers (H.265 9.3.4.3) */
++#define CABAC_RANGE_INIT 0x1FE
++#define CABAC_RANGE_MIN  0x100
++/* a context bin renormalises at most 7 times, a bypass bin writes
++ * one bit: 8 bits per bin bounds the output */
++#define MAX_BITS_PER_BIN 8
++
++/* emulation prevention: 00 00 0x with x <= 3 needs a 03 in between */
++#define EPB_MAX_FOLLOWING 3
++
++#define FEAT_MASK_MV ((1 << FFEDIT_FEAT_MV) | (1 << FFEDIT_FEAT_MV_DELTA))
++#define FEAT_MASK_OUTPUT (1 << FFEDIT_FEAT_LAST)
++
++/*-------------------------------------------------------------------*/
++int ffe_hevc_wants_mv(const AVCodecContext *avctx)
++{
++    uint64_t all = avctx->ffedit_export
++                 | avctx->ffedit_import
++                 | avctx->ffedit_apply;
++    return (all & FEAT_MASK_MV) != 0;
++}
++
++/*-------------------------------------------------------------------*/
++/* growable output packet                                            */
++/*-------------------------------------------------------------------*/
++static int out_append(FFEditHEVCContext *fe, const uint8_t *data, size_t size)
++{
++    void *tmp;
++
++    if ( size == 0 )
++        return 0;
++
++    tmp = av_fast_realloc(fe->out, &fe->out_alloc, fe->out_size + size);
++    if ( tmp == NULL )
++    {
++        fe->out_failed = 1;
++        return AVERROR(ENOMEM);
++    }
++    fe->out = tmp;
++
++    memcpy(fe->out + fe->out_size, data, size);
++    fe->out_size += size;
++
++    return 0;
++}
++
++/* append an RBSP as a NAL payload, re-inserting emulation prevention */
++static int out_append_escaped(FFEditHEVCContext *fe, const uint8_t *rbsp, size_t size)
++{
++    /* at most one 0x03 per two input bytes */
++    uint8_t *esc = av_malloc(size + size / 2 + 1);
++    size_t n = 0;
++    int zeros = 0;
++    int ret;
++
++    if ( esc == NULL )
++        return AVERROR(ENOMEM);
++
++    for ( size_t i = 0; i < size; i++ )
++    {
++        uint8_t b = rbsp[i];
++
++        if ( zeros >= 2 && b <= EPB_MAX_FOLLOWING )
++        {
++            esc[n++] = 0x03;
++            zeros = 0;
++        }
++        esc[n++] = b;
++        zeros = (b == 0) ? zeros + 1 : 0;
++    }
++
++    ret = out_append(fe, esc, n);
++    av_free(esc);
++
++    return ret;
++}
++
++/*-------------------------------------------------------------------*/
++/* bin log                                                           */
++/*-------------------------------------------------------------------*/
++static int log_reserve(FFEditHEVCContext *fe, size_t nb)
++{
++    size_t need = nb * sizeof(FFEditHEVCBin);
++    void *tmp;
++
++    if ( need <= fe->bins_alloc )
++        return 0;
++
++    tmp = av_fast_realloc(fe->bins, &fe->bins_alloc, need);
++    if ( tmp == NULL )
++    {
++        fe->log_failed = 1;
++        return AVERROR(ENOMEM);
++    }
++    fe->bins = tmp;
++
++    return 0;
++}
++
++void ffe_hevc_log_bin(FFEditHEVCContext *fe, int kind, int ctx, int bin)
++{
++    FFEditHEVCBin *b;
++
++    if ( fe->log_failed || log_reserve(fe, fe->nb_bins + 1) < 0 )
++        return;
++
++    b = &fe->bins[fe->nb_bins++];
++    b->kind = kind;
++    b->bin = bin;
++    b->ctx = ctx;
++}
++
++/*-------------------------------------------------------------------*/
++/* CABAC encoder (H.265 9.3.4.3, same engine as H.264)               */
++/*-------------------------------------------------------------------*/
++typedef struct CabacEnc {
++    PutBitContext pb;
++    int low;
++    int range;
++    int outstanding;
++    int first_bit;  /* firstBitFlag: the very first output bit is dropped */
++} CabacEnc;
++
++static void enc_init(CabacEnc *c, uint8_t *buf, int size)
++{
++    init_put_bits(&c->pb, buf, size);
++    c->low = 0;
++    c->range = CABAC_RANGE_INIT;
++    c->outstanding = 0;
++    c->first_bit = 1;
++}
++
++static void enc_put_bit(CabacEnc *c, int b)
++{
++    if ( c->first_bit )
++        c->first_bit = 0;
++    else
++        put_bits(&c->pb, 1, b);
++
++    for ( ; c->outstanding > 0; c->outstanding-- )
++        put_bits(&c->pb, 1, 1 - b);
++}
++
++static void enc_renorm(CabacEnc *c)
++{
++    while ( c->range < CABAC_RANGE_MIN )
++    {
++        if ( c->low < 0x100 )
++        {
++            enc_put_bit(c, 0);
++        }
++        else if ( c->low < 0x200 )
++        {
++            c->outstanding++;
++            c->low -= 0x100;
++        }
++        else
++        {
++            enc_put_bit(c, 1);
++            c->low -= 0x200;
++        }
++        c->range <<= 1;
++        c->low <<= 1;
++    }
++}
++
++static void enc_bin(CabacEnc *c, uint8_t *state, int bin)
++{
++    int range_lps = ff_h264_lps_range[2 * (c->range & 0xC0) + *state];
++
++    if ( bin == (*state & 1) )
++    {
++        c->range -= range_lps;
++        *state = ff_h264_mlps_state[128 + *state];
++    }
++    else
++    {
++        c->low += c->range - range_lps;
++        c->range = range_lps;
++        *state = ff_h264_mlps_state[127 - *state];
++    }
++
++    enc_renorm(c);
++}
++
++static void enc_bypass(CabacEnc *c, int bin)
++{
++    c->low <<= 1;
++    if ( bin )
++        c->low += c->range;
++
++    if ( c->low < 0x200 )
++    {
++        enc_put_bit(c, 0);
++    }
++    else if ( c->low < 0x400 )
++    {
++        c->outstanding++;
++        c->low -= 0x200;
++    }
++    else
++    {
++        enc_put_bit(c, 1);
++        c->low -= 0x400;
++    }
++}
++
++/* the last two bits written on termination end in the
++ * rbsp_stop_one_bit; the caller only has to byte-align */
++static void enc_terminate(CabacEnc *c, int bin)
++{
++    c->range -= 2;
++
++    if ( !bin )
++    {
++        enc_renorm(c);
++        return;
++    }
++
++    c->low += c->range;
++    c->range = 2;
++    enc_renorm(c);
++    enc_put_bit(c, c->low >> 9);
++    put_bits(&c->pb, 2, ((c->low >> 7) & 3) | 1);
++}
++
++/*-------------------------------------------------------------------*/
++/* packet level                                                      */
++/*-------------------------------------------------------------------*/
++void ffe_hevc_packet_start(HEVCContext *s, const AVPacket *avpkt)
++{
++    FFEditHEVCContext *fe = &s->ffe;
++    AVCodecContext *avctx = s->avctx;
++
++    if ( avctx->ffedit_import != 0 )
++    {
++        memcpy(fe->ffedit_sd, avpkt->ffedit_sd, sizeof(fe->ffedit_sd));
++        fe->jctx = avpkt->jctx;
++    }
++
++    fe->out_active = (avctx->ffedit_apply & FEAT_MASK_OUTPUT) != 0;
++    fe->out_failed = 0;
++    fe->out_size = 0;
++    fe->in_buf = avpkt->data;
++    fe->in_size = avpkt->size;
++    fe->in_pos = 0;
++    fe->log_active = 0;
++}
++
++/* hand the rebuilt packet to ffedit (same bookkeeping as
++ * ffe_transplicate_bits_flush()) */
++static void xp_flush(AVCodecContext *avctx, const AVPacket *pkt, const uint8_t *data, size_t size)
++{
++    FFEditTransplicatePacket *packet;
++    size_t nb = avctx->nb_ffe_xp_packets + 1;
++
++    if ( av_reallocp_array(&avctx->ffe_xp_packets, nb, sizeof(FFEditTransplicatePacket)) < 0 )
++        return;
++    avctx->nb_ffe_xp_packets = nb;
++
++    packet = &avctx->ffe_xp_packets[nb - 1];
++    packet->i_pos = pkt->pos;
++    packet->i_size = pkt->size;
++    packet->o_size = size;
++    packet->data = av_malloc(size);
++    memcpy(packet->data, data, size);
++}
++
++void ffe_hevc_packet_end(HEVCContext *s, const AVPacket *avpkt)
++{
++    FFEditHEVCContext *fe = &s->ffe;
++
++    fe->log_active = 0;
++
++    if ( !fe->out_active )
++        return;
++    fe->out_active = 0;
++
++    /* whatever follows the last NAL we looked at is copied as is */
++    out_append(fe, fe->in_buf + fe->in_pos, fe->in_size - fe->in_pos);
++
++    if ( fe->out_failed )
++    {
++        av_log(ffe_class, AV_LOG_WARNING,
++               "HEVC packet at %" PRId64 " could not be rebuilt, copied unchanged\n",
++               avpkt->pos);
++        xp_flush(s->avctx, avpkt, avpkt->data, avpkt->size);
++        return;
++    }
++
++    xp_flush(s->avctx, avpkt, fe->out, fe->out_size);
++}
++
++/*-------------------------------------------------------------------*/
++/* NAL rebuild                                                       */
++/*-------------------------------------------------------------------*/
++/* re-encode the logged slice. returns the new RBSP (caller frees)
++ * or NULL. */
++static uint8_t *rebuild_rbsp(
++        FFEditHEVCContext *fe,
++        const H2645NAL *nal,
++        size_t *out_size)
++{
++    uint8_t state[FFE_HEVC_NB_CONTEXTS];
++    size_t alloc;
++    uint8_t *rbsp;
++    CabacEnc enc;
++    int rem;
++
++    if ( fe->nb_bins == 0 || fe->data_buf != nal->data || fe->data_offset <= 0 || fe->data_offset > nal->size )
++        return NULL;
++
++    /* a slice ends on end_of_slice_segment_flag = 1 and nothing else */
++    if ( fe->bins[fe->nb_bins - 1].kind != FFE_HEVC_BIN_TERM || !fe->bins[fe->nb_bins - 1].bin )
++        return NULL;
++
++    alloc = fe->data_offset + (fe->nb_bins * MAX_BITS_PER_BIN) / 8 + 16 + AV_INPUT_BUFFER_PADDING_SIZE;
++    rbsp = av_malloc(alloc);
++    if ( rbsp == NULL )
++        return NULL;
++
++    /* slice header (with its byte_alignment) is untouched */
++    memcpy(rbsp, nal->data, fe->data_offset);
++
++    memcpy(state, fe->init_state, sizeof(state));
++    enc_init(&enc, rbsp + fe->data_offset, alloc - fe->data_offset);
++
++    for ( size_t i = 0; i < fe->nb_bins; i++ )
++    {
++        const FFEditHEVCBin *b = &fe->bins[i];
++
++        switch ( b->kind )
++        {
++        case FFE_HEVC_BIN_CTX:
++            enc_bin(&enc, &state[b->ctx], b->bin);
++            break;
++        case FFE_HEVC_BIN_BYPASS:
++            enc_bypass(&enc, b->bin);
++            break;
++        case FFE_HEVC_BIN_TERM:
++            enc_terminate(&enc, b->bin);
++            break;
++        }
++    }
++
++    /* rbsp_slice_segment_trailing_bits(): the stop bit was written by
++     * the terminating bin, only the alignment is left */
++    rem = put_bits_count(&enc.pb) & 7;
++    if ( rem != 0 )
++        put_bits(&enc.pb, 8 - rem, 0);
++    flush_put_bits(&enc.pb);
++
++    *out_size = fe->data_offset + put_bytes_output(&enc.pb);
++
++    return rbsp;
++}
++
++static int is_vcl(const H2645NAL *nal)
++{
++    return nal->type <= HEVC_NAL_CRA_NUT;
++}
++
++void ffe_hevc_nal_done(HEVCContext *s, const H2645NAL *nal)
++{
++    FFEditHEVCContext *fe = &s->ffe;
++    int nb_edits = (is_vcl(nal) && fe->log_active && !fe->log_failed) ? fe->nb_edits : 0;
++    int failed = is_vcl(nal) && fe->log_active && fe->log_failed;
++    size_t off;
++
++    /* the log belongs to this NAL only */
++    fe->log_active = 0;
++    fe->nb_edits = 0;
++
++    if ( !fe->out_active || fe->out_failed )
++        return;
++
++    if ( failed )
++    {
++        fe->out_failed = 1;
++        return;
++    }
++
++    off = nal->raw_data - fe->in_buf;
++    if ( nal->raw_data < fe->in_buf || off < fe->in_pos || off + nal->raw_size > fe->in_size )
++    {
++        fe->out_failed = 1;
++        return;
++    }
++
++    /* start code and anything else between NALs */
++    out_append(fe, fe->in_buf + fe->in_pos, off - fe->in_pos);
++    fe->in_pos = off + nal->raw_size;
++
++    if ( nb_edits == 0 )
++    {
++        out_append(fe, nal->raw_data, nal->raw_size);
++        return;
++    }
++
++    {
++        size_t rbsp_size = 0;
++        uint8_t *rbsp = rebuild_rbsp(fe, nal, &rbsp_size);
++
++        if ( rbsp == NULL )
++        {
++            fe->out_failed = 1;
++            return;
++        }
++
++        out_append_escaped(fe, rbsp, rbsp_size);
++        av_free(rbsp);
++    }
++}
++
++/*-------------------------------------------------------------------*/
++/* slice level                                                       */
++/*-------------------------------------------------------------------*/
++static void refuse(const char *what, const char *hint)
++{
++    av_log(ffe_class, AV_LOG_FATAL, "This HEVC stream uses %s.\n", what);
++    av_log(ffe_class, AV_LOG_FATAL,
++           "FFedit only supports the mv/mv_delta features on HEVC without it.\n");
++    if ( hint != NULL )
++        av_log(ffe_class, AV_LOG_FATAL, "%s\n", hint);
++    exit(1);
++}
++
++void ffe_hevc_check_slice(const HEVCContext *s)
++{
++    const HEVCPPS *pps = s->ps.pps;
++    const HEVCSPS *sps = s->ps.sps;
++
++    if ( !ffe_hevc_wants_mv(s->avctx) )
++        return;
++
++    if ( s->is_nalff )
++    {
++        av_log(ffe_class, AV_LOG_FATAL,
++               "This HEVC stream is length-prefixed (hvcC, e.g. inside MP4/MKV).\n");
++        av_log(ffe_class, AV_LOG_FATAL,
++               "FFedit only supports the mv/mv_delta features on raw Annex B HEVC (.265/.hevc).\n");
++        exit(1);
++    }
++
++    if ( pps->entropy_coding_sync_enabled_flag )
++        refuse("wavefront parallel processing (entropy_coding_sync_enabled_flag=1)",
++               "Re-encode without WPP (e.g. x265 --no-wpp).");
++    if ( pps->tiles_enabled_flag )
++        refuse("tiles (tiles_enabled_flag=1)", "Re-encode without tiles.");
++    if ( s->sh.dependent_slice_segment_flag )
++        refuse("dependent slice segments", NULL);
++    if ( sps->pcm_enabled_flag )
++        refuse("PCM coding (pcm_enabled_flag=1)", NULL);
++    if ( sps->cabac_bypass_alignment_enabled_flag )
++        refuse("CABAC bypass alignment", NULL);
++
++    if ( s->threads_number != 1 || (s->avctx->active_thread_type & FF_THREAD_FRAME) )
++    {
++        av_log(ffe_class, AV_LOG_FATAL,
++               "FFedit HEVC support requires a single decoding thread (threads=1).\n");
++        exit(1);
++    }
++}
++
++/* the CABAC decoder was just initialised on the first CTB of a slice
++ * segment: remember where the data starts and the context states */
++void ffe_hevc_slice_data_start(HEVCLocalContext *lc)
++{
++    FFEditHEVCContext *fe = lc->ffe;
++    const HEVCContext *s = lc->parent;
++
++    if ( fe == NULL )
++        return;
++
++    fe->log_active = fe->out_active && ffe_hevc_wants_mv(s->avctx);
++    fe->log_failed = 0;
++    fe->nb_bins = 0;
++    fe->nb_edits = 0;
++    fe->data_offset = get_bits_count(&lc->gb) / 8;
++    fe->data_buf = lc->gb.buffer;
++    memcpy(fe->init_state, lc->cabac_state, sizeof(fe->init_state));
++}
++
++/*-------------------------------------------------------------------*/
++/* frame level                                                       */
++/*-------------------------------------------------------------------*/
++static int max_pus_per_ctb(const HEVCSPS *sps)
++{
++    int shift = 2 * (sps->log2_ctb_size - MIN_INTER_CU_LOG2);
++    return PUS_PER_MIN_CU << shift;
++}
++
++void ffe_hevc_frame_start(HEVCContext *s)
++{
++    AVCodecContext *avctx = s->avctx;
++    FFEditHEVCContext *fe = &s->ffe;
++    const HEVCSPS *sps = s->ps.sps;
++    AVFrame *f = s->ref->frame;
++    int max_nb_blocks = FFMIN(max_pus_per_ctb(sps), MAX_MV2DARRAY_NBLOCKS);
++    json_ctx_t *jctx;
++
++    if ( avctx->ffedit_export == 0 && avctx->ffedit_import == 0 )
++        return;
++
++    /* one jctx per exported frame; importing borrows the packet's */
++    if ( avctx->ffedit_export != 0 )
++    {
++        f->jctx = json_ctx_new(1);
++        jctx = f->jctx;
++    }
++    else
++    {
++        jctx = fe->jctx;
++    }
++
++    if ( avctx->ffedit_import != 0 )
++        memcpy(f->ffedit_sd, fe->ffedit_sd, sizeof(json_t *) * FFEDIT_FEAT_LAST);
++
++    if ( (avctx->ffedit_export & (1 << FFEDIT_FEAT_MV)) != 0 )
++        ffe_mv_export_init_dirs(FFEDIT_FEAT_MV, jctx, f, sps->ctb_height, sps->ctb_width, NB_DIRECTIONS, max_nb_blocks);
++    else if ( (avctx->ffedit_import & (1 << FFEDIT_FEAT_MV)) != 0 && f->ffedit_sd[FFEDIT_FEAT_MV] != NULL )
++        ffe_mv_import_init(jctx, f);
++
++    if ( (avctx->ffedit_export & (1 << FFEDIT_FEAT_MV_DELTA)) != 0 )
++        ffe_mv_export_init_dirs(FFEDIT_FEAT_MV_DELTA, jctx, f, sps->ctb_height, sps->ctb_width, NB_DIRECTIONS, max_nb_blocks);
++    else if ( (avctx->ffedit_import & (1 << FFEDIT_FEAT_MV_DELTA)) != 0 && f->ffedit_sd[FFEDIT_FEAT_MV_DELTA] != NULL )
++        ffe_mv_delta_import_init(jctx, f);
++
++    fe->max_nb_blocks = max_nb_blocks;
++    fe->frame_active = 1;
++}
++
++void ffe_hevc_frame_end(HEVCContext *s)
++{
++    AVCodecContext *avctx = s->avctx;
++    FFEditHEVCContext *fe = &s->ffe;
++    AVFrame *f;
++
++    if ( !fe->frame_active || s->ref == NULL )
++        return;
++    fe->frame_active = 0;
++
++    f = s->ref->frame;
++    if ( (avctx->ffedit_export & (1 << FFEDIT_FEAT_MV)) != 0 )
++        ffe_mv_export_cleanup_dirs(FFEDIT_FEAT_MV, f->jctx, f);
++    if ( (avctx->ffedit_export & (1 << FFEDIT_FEAT_MV_DELTA)) != 0 )
++        ffe_mv_export_cleanup_dirs(FFEDIT_FEAT_MV_DELTA, f->jctx, f);
++}
++
++/*-------------------------------------------------------------------*/
++/* CTB / PU level                                                    */
++/*-------------------------------------------------------------------*/
++void ffe_hevc_ctb_start(HEVCLocalContext *lc, int x_ctb, int y_ctb)
++{
++    FFEditHEVCContext *fe = lc->ffe;
++    int log2_ctb = lc->parent->ps.sps->log2_ctb_size;
++
++    if ( fe == NULL )
++        return;
++
++    memset(&fe->mv, 0, sizeof(fe->mv));
++    memset(&fe->mv_delta, 0, sizeof(fe->mv_delta));
++    fe->mv.mb_x = fe->mv_delta.mb_x = x_ctb >> log2_ctb;
++    fe->mv.mb_y = fe->mv_delta.mb_y = y_ctb >> log2_ctb;
++    fe->blockn[0] = 0;
++    fe->blockn[1] = 0;
++}
++
++void ffe_hevc_mvd_start(HEVCLocalContext *lc, int g0_ctx, int g1_ctx)
++{
++    FFEditHEVCContext *fe = lc->ffe;
++
++    if ( fe == NULL )
++        return;
++    fe->mvd_start = fe->nb_bins;
++    fe->mvd_g0_ctx = g0_ctx;
++    fe->mvd_g1_ctx = g1_ctx;
++}
++
++void ffe_hevc_mvd_end(HEVCLocalContext *lc)
++{
++    FFEditHEVCContext *fe = lc->ffe;
++
++    if ( fe != NULL )
++        fe->mvd_end = fe->nb_bins;
++}
++
++/* read one component of a [x,y] pair, or fallback */
++static int pair_get(json_t *jmv, int x_or_y, int fallback)
++{
++    if ( jmv == NULL )
++        return fallback;
++
++    if ( JSON_TYPE(jmv->flags) == JSON_TYPE_ARRAY_OF_INTS && json_array_length(jmv) == 2 )
++        return jmv->array_of_ints[x_or_y];
++
++    if ( JSON_TYPE(jmv->flags) == JSON_TYPE_ARRAY && json_array_length(jmv) == 2 )
++    {
++        json_t *jval = json_array_get(jmv, x_or_y);
++        if ( jval != NULL && JSON_TYPE(jval->flags) == JSON_TYPE_NUMBER && !is_json_null(jval) )
++            return json_int_val(jval);
++    }
++
++    return fallback;
++}
++
++/* look up the imported value for this block; the JSON per CTB is
++ * null, [x,y] (one block) or [[x,y],...] (blocks in decode order). */
++static int import_get(
++        const ffe_mv_mb_ctx *mbctx,
++        AVFrame *f,
++        enum FFEditFeature feat,
++        int dir,
++        int blockn,
++        int x_or_y,
++        int fallback)
++{
++    json_t *jframe = f->ffedit_sd[feat];
++    ffe_mv_ctx *ctx;
++    json_t *jdata;
++    json_t *jrow;
++    json_t *jmb;
++
++    if ( jframe == NULL )
++        return fallback;
++    ctx = json_object_userdata_get(jframe);
++    if ( ctx == NULL )
++        return fallback;
++    jdata = ctx->data[dir];
++    if ( jdata == NULL )
++        return fallback;
++
++    /* scripting hands us the native 2d array back */
++    if ( ctx->import_is_mv2darray[dir] )
++    {
++        json_mv2darray_t *jmv2d = jdata->mv2darray;
++        size_t idx = mbctx->mb_y * jmv2d->width + mbctx->mb_x;
++        int32_t *mv;
++
++        if ( blockn >= jmv2d->max_nb_blocks || mbctx->mb_y >= jmv2d->height || mbctx->mb_x >= jmv2d->width )
++            return fallback;
++        mv = &jmv2d->mvs[blockn][idx << 1];
++        if ( mv[0] == MV_NULL )
++            return fallback;
++        return mv[x_or_y];
++    }
++
++    if ( JSON_TYPE(jdata->flags) != JSON_TYPE_ARRAY || json_array_length(jdata) <= mbctx->mb_y )
++        return fallback;
++    jrow = json_array_get(jdata, mbctx->mb_y);
++    if ( jrow == NULL || JSON_TYPE(jrow->flags) != JSON_TYPE_ARRAY || json_array_length(jrow) <= mbctx->mb_x )
++        return fallback;
++    jmb = json_array_get(jrow, mbctx->mb_x);
++    if ( jmb == NULL )
++        return fallback;
++
++    if ( JSON_TYPE(jmb->flags) == JSON_TYPE_ARRAY )
++    {
++        if ( json_array_length(jmb) <= blockn )
++            return fallback;
++        jmb = json_array_get(jmb, blockn);
++    }
++    else if ( blockn != 0 )
++    {
++        return fallback;
++    }
++
++    return pair_get(jmb, x_or_y, fallback);
++}
++
++/* binarisation of one mvd component after the greater0/greater1
++ * flags: abs_mvd_minus2 as EG1 bypass bins, then mvd_sign_flag */
++static int mvd_suffix_bins(FFEditHEVCBin *dst, int v)
++{
++    int n = 0;
++    int a = FFABS(v);
++
++    if ( a > 1 )
++    {
++        int rem = a - 2;
++        int k = MVD_EG_K;
++
++        while ( rem >= (1 << k) )
++        {
++            dst[n].kind = FFE_HEVC_BIN_BYPASS; dst[n].ctx = 0; dst[n++].bin = 1;
++            rem -= 1 << k;
++            k++;
++        }
++        dst[n].kind = FFE_HEVC_BIN_BYPASS; dst[n].ctx = 0; dst[n++].bin = 0;
++        while ( k-- > 0 )
++        {
++            dst[n].kind = FFE_HEVC_BIN_BYPASS; dst[n].ctx = 0; dst[n++].bin = (rem >> k) & 1;
++        }
++    }
++    if ( a > 0 )
++    {
++        dst[n].kind = FFE_HEVC_BIN_BYPASS; dst[n].ctx = 0; dst[n++].bin = v < 0;
++    }
++
++    return n;
++}
++
++/* mirror of ff_hevc_hls_mvd_coding() */
++static int mvd_bins(FFEditHEVCBin *dst, int g0_ctx, int g1_ctx, int x, int y)
++{
++    int ax = FFABS(x);
++    int ay = FFABS(y);
++    int n = 0;
++
++    dst[n].kind = FFE_HEVC_BIN_CTX; dst[n].ctx = g0_ctx; dst[n++].bin = ax > 0;
++    dst[n].kind = FFE_HEVC_BIN_CTX; dst[n].ctx = g0_ctx; dst[n++].bin = ay > 0;
++    if ( ax > 0 )
++    {
++        dst[n].kind = FFE_HEVC_BIN_CTX; dst[n].ctx = g1_ctx; dst[n++].bin = ax > 1;
++    }
++    if ( ay > 0 )
++    {
++        dst[n].kind = FFE_HEVC_BIN_CTX; dst[n].ctx = g1_ctx; dst[n++].bin = ay > 1;
++    }
++    n += mvd_suffix_bins(dst + n, x);
++    n += mvd_suffix_bins(dst + n, y);
++
++    return n;
++}
++
++/* replace the logged mvd group with the bins of (x, y) */
++static void splice_mvd(FFEditHEVCContext *fe, int x, int y)
++{
++    FFEditHEVCBin grp[MAX_MVD_BINS];
++    size_t old_n = fe->mvd_end - fe->mvd_start;
++    size_t tail = fe->nb_bins - fe->mvd_end;
++    int n;
++
++    if ( fe->log_failed || fe->mvd_end < fe->mvd_start || fe->mvd_end > fe->nb_bins || old_n < 2 )
++    {
++        fe->log_failed = 1;
++        return;
++    }
++
++    n = mvd_bins(grp, fe->mvd_g0_ctx, fe->mvd_g1_ctx, x, y);
++
++    if ( log_reserve(fe, fe->nb_bins - old_n + n) < 0 )
++        return;
++
++    memmove(fe->bins + fe->mvd_start + n, fe->bins + fe->mvd_end, tail * sizeof(FFEditHEVCBin));
++    memcpy(fe->bins + fe->mvd_start, grp, n * sizeof(FFEditHEVCBin));
++    fe->nb_bins += n - old_n;
++    fe->mvd_end = fe->mvd_start + n;
++    fe->nb_edits++;
++}
++
++static void warn_wrapped(int mv)
++{
++    static int warned = 0;
++
++    if ( warned )
++        return;
++    warned = 1;
++    av_log(ffe_class, AV_LOG_WARNING,
++           "HEVC mv %d outside [%d, %d], wrapped (further warnings suppressed)\n",
++           mv, MVD_MIN, MVD_MAX);
++}
++
++void ffe_hevc_mvd(HEVCLocalContext *lc, int list, int pred_x, int pred_y, Mv *mvd)
++{
++    FFEditHEVCContext *fe = lc->ffe;
++    const HEVCContext *s = lc->parent;
++    const AVCodecContext *avctx = s->avctx;
++    AVFrame *f = s->ref->frame;
++    int blockn;
++    int orig_x = mvd->x;
++    int orig_y = mvd->y;
++    int x = orig_x;
++    int y = orig_y;
++
++    if ( fe == NULL )
++        return;
++    blockn = fe->blockn[list]++;
++
++    if ( (avctx->ffedit_import & (1 << FFEDIT_FEAT_MV_DELTA)) != 0 )
++    {
++        x = WRAP16(import_get(&fe->mv_delta, f, FFEDIT_FEAT_MV_DELTA, list, blockn, 0, x));
++        y = WRAP16(import_get(&fe->mv_delta, f, FFEDIT_FEAT_MV_DELTA, list, blockn, 1, y));
++    }
++
++    /* "mv" is the final vector; the stream carries the difference.
++     * the decoder adds in int16, so any target wraps exactly. */
++    if ( (avctx->ffedit_import & (1 << FFEDIT_FEAT_MV)) != 0 )
++    {
++        int tx = import_get(&fe->mv, f, FFEDIT_FEAT_MV, list, blockn, 0, WRAP16(pred_x + x));
++        int ty = import_get(&fe->mv, f, FFEDIT_FEAT_MV, list, blockn, 1, WRAP16(pred_y + y));
++
++        if ( tx < MVD_MIN || tx > MVD_MAX )
++            warn_wrapped(tx);
++        if ( ty < MVD_MIN || ty > MVD_MAX )
++            warn_wrapped(ty);
++        x = WRAP16(tx - pred_x);
++        y = WRAP16(ty - pred_y);
++    }
++
++    if ( fe->log_active && (x != orig_x || y != orig_y) )
++        splice_mvd(fe, x, y);
++
++    mvd->x = x;
++    mvd->y = y;
++
++    if ( blockn >= fe->max_nb_blocks )
++        return;
++
++    if ( (avctx->ffedit_export & (1 << FFEDIT_FEAT_MV)) != 0 )
++    {
++        ffe_mv_export_select(&fe->mv, f, list, blockn);
++        ffe_mv_set(&fe->mv, 0, WRAP16(pred_x + x));
++        ffe_mv_set(&fe->mv, 1, WRAP16(pred_y + y));
++    }
++
++    if ( (avctx->ffedit_export & (1 << FFEDIT_FEAT_MV_DELTA)) != 0 )
++    {
++        ffe_mv_delta_export_select(&fe->mv_delta, f, list, blockn);
++        ffe_mv_delta_set(&fe->mv_delta, 0, x);
++        ffe_mv_delta_set(&fe->mv_delta, 1, y);
++    }
++}
++
++/*-------------------------------------------------------------------*/
++void ffe_hevc_uninit(HEVCContext *s)
++{
++    FFEditHEVCContext *fe = &s->ffe;
++
++    av_freep(&fe->bins);
++    fe->bins_alloc = 0;
++    fe->nb_bins = 0;
++    av_freep(&fe->out);
++    fe->out_alloc = 0;
++    fe->out_size = 0;
++}
+diff --git a/libavcodec/ffedit_hevc.h b/libavcodec/ffedit_hevc.h
+new file mode 100644
+index 0000000..56b068d
+--- /dev/null
++++ b/libavcodec/ffedit_hevc.h
+@@ -0,0 +1,173 @@
++/*
++ * Copyright (c) 2026 Riposte Laboratories
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#ifndef AVCODEC_FFEDIT_HEVC_H
++#define AVCODEC_FFEDIT_HEVC_H
++
++#include <stddef.h>
++#include <stdint.h>
++
++#include "avcodec.h"
++#include "packet.h"
++#include "ffedit_mv.h"
++#include "h2645_parse.h"
++
++struct HEVCContext;
++struct HEVCLocalContext;
++struct Mv;
++
++/*
++ * FFedit for HEVC.
++ *
++ * HEVC slice data is CABAC only, so no syntax element can be rewritten
++ * in place: the arithmetic coder state after an edited mvd differs
++ * from the original and every following bit changes.  Instead the
++ * whole slice is re-encoded from its bins:
++ *
++ *   decoder:  bin bin bin [mvd bins] bin bin ... [end_of_slice]
++ *                |   |   |    |
++ *                v   v   v    v            (every bin is logged with
++ *   log:      (ctx,b)(ctx,b)(bypass,b)...   its context or bypass/term)
++ *
++ *   apply:    replace the logged mvd group, re-run the CABAC encoder
++ *             over the log from the slice's initial context states,
++ *             append rbsp_slice_segment_trailing_bits, re-insert
++ *             emulation prevention bytes.
++ *
++ * Context selection never depends on an mvd value and the mvd bins
++ * form one contiguous group, so splicing a group leaves every other
++ * bin and its context untouched.  NALs without edits are copied raw.
++ *
++ * Refused with a clear message when an mv feature is requested: WPP,
++ * tiles, dependent slice segments, PCM, CABAC bypass alignment,
++ * length-prefixed (hvcC) input, more than one decoding thread.
++ */
++
++/* one logged bin */
++enum FFEditHEVCBinKind {
++    FFE_HEVC_BIN_CTX = 0,
++    FFE_HEVC_BIN_BYPASS,
++    FFE_HEVC_BIN_TERM,
++};
++
++typedef struct FFEditHEVCBin {
++    uint8_t  kind;
++    uint8_t  bin;
++    uint16_t ctx;
++} FFEditHEVCBin;
++
++/* sized for HEVC_CONTEXTS without pulling in hevcdec.h */
++#define FFE_HEVC_NB_CONTEXTS 199
++
++typedef struct FFEditHEVCContext {
++    /* import: JSON side data handed over by the packet */
++    void *jctx;
++    void *ffedit_sd[32]; // should be at least [FFEDIT_FEAT_LAST]
++
++    /* export: set between frame start and frame end */
++    int frame_active;
++    ffe_mv_mb_ctx mv;
++    ffe_mv_mb_ctx mv_delta;
++    int blockn[2];
++
++    /* apply: the packet being rebuilt */
++    const uint8_t *in_buf;
++    size_t in_size;
++    size_t in_pos;      /* input bytes consumed so far */
++    uint8_t *out;
++    size_t out_size;
++    unsigned out_alloc;
++    int out_active;
++    int out_failed;
++
++    /* apply: the slice being logged */
++    int log_active;
++    int log_failed;
++    FFEditHEVCBin *bins;
++    size_t nb_bins;
++    unsigned bins_alloc;
++    uint8_t init_state[FFE_HEVC_NB_CONTEXTS];
++    int data_offset;    /* first slice data byte, from the NAL start */
++    int nb_edits;
++    size_t mvd_start;   /* log range of the mvd group just decoded */
++    size_t mvd_end;
++    int mvd_g0_ctx;     /* contexts of abs_mvd_greater0/1_flag */
++    int mvd_g1_ctx;
++    const uint8_t *data_buf; /* the RBSP the offsets refer to */
++    int max_nb_blocks;  /* PUs per CTB the export arrays hold */
++} FFEditHEVCContext;
++
++int  ffe_hevc_wants_mv(const AVCodecContext *avctx);
++
++void ffe_hevc_packet_start(struct HEVCContext *s, const AVPacket *avpkt);
++void ffe_hevc_packet_end(struct HEVCContext *s, const AVPacket *avpkt);
++void ffe_hevc_nal_done(struct HEVCContext *s, const H2645NAL *nal);
++
++void ffe_hevc_check_slice(const struct HEVCContext *s);
++void ffe_hevc_slice_data_start(struct HEVCLocalContext *lc);
++
++void ffe_hevc_frame_start(struct HEVCContext *s);
++void ffe_hevc_frame_end(struct HEVCContext *s);
++
++void ffe_hevc_ctb_start(struct HEVCLocalContext *lc, int x_ctb, int y_ctb);
++void ffe_hevc_mvd_start(struct HEVCLocalContext *lc, int g0_ctx, int g1_ctx);
++void ffe_hevc_mvd_end(struct HEVCLocalContext *lc);
++void ffe_hevc_mvd(struct HEVCLocalContext *lc,
++                  int list,
++                  int pred_x,
++                  int pred_y,
++                  struct Mv *mvd);
++
++void ffe_hevc_uninit(struct HEVCContext *s);
++
++/* bin logging, wrapped around every CABAC read in hevc_cabac.c */
++void ffe_hevc_log_bin(FFEditHEVCContext *fe, int kind, int ctx, int bin);
++
++static inline int ffe_hevc_bin(FFEditHEVCContext *fe, int ctx, int bin)
++{
++    if ( fe != NULL && fe->log_active )
++        ffe_hevc_log_bin(fe, FFE_HEVC_BIN_CTX, ctx, bin);
++    return bin;
++}
++
++static inline int ffe_hevc_bypass(FFEditHEVCContext *fe, int bin)
++{
++    if ( fe != NULL && fe->log_active )
++        ffe_hevc_log_bin(fe, FFE_HEVC_BIN_BYPASS, 0, bin);
++    return bin;
++}
++
++/* get_cabac_bypass_sign(c, val) returns -val for bin 0 and val for
++ * bin 1; every caller passes a negative val, so bin = (ret < 0) */
++static inline int ffe_hevc_bypass_sign(FFEditHEVCContext *fe, int ret)
++{
++    if ( fe != NULL && fe->log_active )
++        ffe_hevc_log_bin(fe, FFE_HEVC_BIN_BYPASS, 0, ret < 0);
++    return ret;
++}
++
++static inline int ffe_hevc_term(FFEditHEVCContext *fe, int ret)
++{
++    if ( fe != NULL && fe->log_active )
++        ffe_hevc_log_bin(fe, FFE_HEVC_BIN_TERM, 0, ret != 0);
++    return ret;
++}
++
++#endif /* AVCODEC_FFEDIT_HEVC_H */
+diff --git a/libavcodec/hevc_cabac.c b/libavcodec/hevc_cabac.c
+index 63ffb3d..286a5ad 100644
+--- a/libavcodec/hevc_cabac.c
++++ b/libavcodec/hevc_cabac.c
+@@ -473,6 +473,7 @@ int ff_hevc_cabac_init(HEVCLocalContext *lc, int ctb_addr_ts)
+             (s->ps.pps->tiles_enabled_flag &&
+              s->ps.pps->tile_id[ctb_addr_ts] != s->ps.pps->tile_id[ctb_addr_ts - 1]))
+             cabac_init_state(lc, s);
++        ffe_hevc_slice_data_start(lc);
+ 
+         if (!s->sh.first_slice_in_pic_flag &&
+             s->ps.pps->entropy_coding_sync_enabled_flag) {
+@@ -518,7 +519,7 @@ int ff_hevc_cabac_init(HEVCLocalContext *lc, int ctb_addr_ts)
+     return 0;
+ }
+ 
+-#define GET_CABAC(ctx)  get_cabac(&lc->cc, &lc->cabac_state[ctx])
++#define GET_CABAC(ctx)  ffe_hevc_bin(lc->ffe, ctx, get_cabac(&lc->cc, &lc->cabac_state[ctx]))
+ 
+ int ff_hevc_sao_merge_flag_decode(HEVCLocalContext *lc)
+ {
+@@ -530,7 +531,7 @@ int ff_hevc_sao_type_idx_decode(HEVCLocalContext *lc)
+     if (!GET_CABAC(SAO_TYPE_IDX_OFFSET))
+         return 0;
+ 
+-    if (!get_cabac_bypass(&lc->cc))
++    if (!ffe_hevc_bypass(lc->ffe, get_cabac_bypass(&lc->cc)))
+         return SAO_BAND;
+     return SAO_EDGE;
+ }
+@@ -538,10 +539,10 @@ int ff_hevc_sao_type_idx_decode(HEVCLocalContext *lc)
+ int ff_hevc_sao_band_position_decode(HEVCLocalContext *lc)
+ {
+     int i;
+-    int value = get_cabac_bypass(&lc->cc);
++    int value = ffe_hevc_bypass(lc->ffe, get_cabac_bypass(&lc->cc));
+ 
+     for (i = 0; i < 4; i++)
+-        value = (value << 1) | get_cabac_bypass(&lc->cc);
++        value = (value << 1) | ffe_hevc_bypass(lc->ffe, get_cabac_bypass(&lc->cc));
+     return value;
+ }
+ 
+@@ -550,26 +551,26 @@ int ff_hevc_sao_offset_abs_decode(HEVCLocalContext *lc)
+     int i = 0;
+     int length = (1 << (FFMIN(lc->parent->ps.sps->bit_depth, 10) - 5)) - 1;
+ 
+-    while (i < length && get_cabac_bypass(&lc->cc))
++    while (i < length && ffe_hevc_bypass(lc->ffe, get_cabac_bypass(&lc->cc)))
+         i++;
+     return i;
+ }
+ 
+ int ff_hevc_sao_offset_sign_decode(HEVCLocalContext *lc)
+ {
+-    return get_cabac_bypass(&lc->cc);
++    return ffe_hevc_bypass(lc->ffe, get_cabac_bypass(&lc->cc));
+ }
+ 
+ int ff_hevc_sao_eo_class_decode(HEVCLocalContext *lc)
+ {
+-    int ret = get_cabac_bypass(&lc->cc) << 1;
+-    ret    |= get_cabac_bypass(&lc->cc);
++    int ret = ffe_hevc_bypass(lc->ffe, get_cabac_bypass(&lc->cc)) << 1;
++    ret    |= ffe_hevc_bypass(lc->ffe, get_cabac_bypass(&lc->cc));
+     return ret;
+ }
+ 
+ int ff_hevc_end_of_slice_flag_decode(HEVCLocalContext *lc)
+ {
+-    return get_cabac_terminate(&lc->cc);
++    return ffe_hevc_term(lc->ffe, get_cabac_terminate(&lc->cc));
+ }
+ 
+ int ff_hevc_cu_transquant_bypass_flag_decode(HEVCLocalContext *lc)
+@@ -605,7 +606,7 @@ int ff_hevc_cu_qp_delta_abs(HEVCLocalContext *lc)
+     }
+     if (prefix_val >= 5) {
+         int k = 0;
+-        while (k < 7 && get_cabac_bypass(&lc->cc)) {
++        while (k < 7 && ffe_hevc_bypass(lc->ffe, get_cabac_bypass(&lc->cc))) {
+             suffix_val += 1 << k;
+             k++;
+         }
+@@ -615,14 +616,14 @@ int ff_hevc_cu_qp_delta_abs(HEVCLocalContext *lc)
+         }
+ 
+         while (k--)
+-            suffix_val += get_cabac_bypass(&lc->cc) << k;
++            suffix_val += ffe_hevc_bypass(lc->ffe, get_cabac_bypass(&lc->cc)) << k;
+     }
+     return prefix_val + suffix_val;
+ }
+ 
+ int ff_hevc_cu_qp_delta_sign_flag(HEVCLocalContext *lc)
+ {
+-    return get_cabac_bypass(&lc->cc);
++    return ffe_hevc_bypass(lc->ffe, get_cabac_bypass(&lc->cc));
+ }
+ 
+ int ff_hevc_cu_chroma_qp_offset_flag(HEVCLocalContext *lc)
+@@ -692,21 +693,21 @@ int ff_hevc_part_mode_decode(HEVCLocalContext *lc, int log2_cb_size)
+     if (GET_CABAC(PART_MODE_OFFSET + 1)) { // 01X, 01XX
+         if (GET_CABAC(PART_MODE_OFFSET + 3)) // 011
+             return PART_2NxN;
+-        if (get_cabac_bypass(&lc->cc)) // 0101
++        if (ffe_hevc_bypass(lc->ffe, get_cabac_bypass(&lc->cc))) // 0101
+             return PART_2NxnD;
+         return PART_2NxnU; // 0100
+     }
+ 
+     if (GET_CABAC(PART_MODE_OFFSET + 3)) // 001
+         return PART_Nx2N;
+-    if (get_cabac_bypass(&lc->cc)) // 0001
++    if (ffe_hevc_bypass(lc->ffe, get_cabac_bypass(&lc->cc))) // 0001
+         return PART_nRx2N;
+     return PART_nLx2N;  // 0000
+ }
+ 
+ int ff_hevc_pcm_flag_decode(HEVCLocalContext *lc)
+ {
+-    return get_cabac_terminate(&lc->cc);
++    return ffe_hevc_term(lc->ffe, get_cabac_terminate(&lc->cc));
+ }
+ 
+ int ff_hevc_prev_intra_luma_pred_flag_decode(HEVCLocalContext *lc)
+@@ -717,7 +718,7 @@ int ff_hevc_prev_intra_luma_pred_flag_decode(HEVCLocalContext *lc)
+ int ff_hevc_mpm_idx_decode(HEVCLocalContext *lc)
+ {
+     int i = 0;
+-    while (i < 2 && get_cabac_bypass(&lc->cc))
++    while (i < 2 && ffe_hevc_bypass(lc->ffe, get_cabac_bypass(&lc->cc)))
+         i++;
+     return i;
+ }
+@@ -725,10 +726,10 @@ int ff_hevc_mpm_idx_decode(HEVCLocalContext *lc)
+ int ff_hevc_rem_intra_luma_pred_mode_decode(HEVCLocalContext *lc)
+ {
+     int i;
+-    int value = get_cabac_bypass(&lc->cc);
++    int value = ffe_hevc_bypass(lc->ffe, get_cabac_bypass(&lc->cc));
+ 
+     for (i = 0; i < 4; i++)
+-        value = (value << 1) | get_cabac_bypass(&lc->cc);
++        value = (value << 1) | ffe_hevc_bypass(lc->ffe, get_cabac_bypass(&lc->cc));
+     return value;
+ }
+ 
+@@ -738,8 +739,8 @@ int ff_hevc_intra_chroma_pred_mode_decode(HEVCLocalContext *lc)
+     if (!GET_CABAC(INTRA_CHROMA_PRED_MODE_OFFSET))
+         return 4;
+ 
+-    ret  = get_cabac_bypass(&lc->cc) << 1;
+-    ret |= get_cabac_bypass(&lc->cc);
++    ret  = ffe_hevc_bypass(lc->ffe, get_cabac_bypass(&lc->cc)) << 1;
++    ret |= ffe_hevc_bypass(lc->ffe, get_cabac_bypass(&lc->cc));
+     return ret;
+ }
+ 
+@@ -748,7 +749,7 @@ int ff_hevc_merge_idx_decode(HEVCLocalContext *lc)
+     int i = GET_CABAC(MERGE_IDX_OFFSET);
+ 
+     if (i != 0) {
+-        while (i < lc->parent->sh.max_num_merge_cand-1 && get_cabac_bypass(&lc->cc))
++        while (i < lc->parent->sh.max_num_merge_cand-1 && ffe_hevc_bypass(lc->ffe, get_cabac_bypass(&lc->cc)))
+             i++;
+     }
+     return i;
+@@ -778,7 +779,7 @@ int ff_hevc_ref_idx_lx_decode(HEVCLocalContext *lc, int num_ref_idx_lx)
+     while (i < max_ctx && GET_CABAC(REF_IDX_L0_OFFSET + i))
+         i++;
+     if (i == 2) {
+-        while (i < max && get_cabac_bypass(&lc->cc))
++        while (i < max && ffe_hevc_bypass(lc->ffe, get_cabac_bypass(&lc->cc)))
+             i++;
+     }
+ 
+@@ -810,7 +811,7 @@ static av_always_inline int mvd_decode(HEVCLocalContext *lc)
+     int ret = 2;
+     int k = 1;
+ 
+-    while (k < CABAC_MAX_BIN && get_cabac_bypass(&lc->cc)) {
++    while (k < CABAC_MAX_BIN && ffe_hevc_bypass(lc->ffe, get_cabac_bypass(&lc->cc))) {
+         ret += 1U << k;
+         k++;
+     }
+@@ -819,13 +820,13 @@ static av_always_inline int mvd_decode(HEVCLocalContext *lc)
+         return 0;
+     }
+     while (k--)
+-        ret += get_cabac_bypass(&lc->cc) << k;
+-    return get_cabac_bypass_sign(&lc->cc, -ret);
++        ret += ffe_hevc_bypass(lc->ffe, get_cabac_bypass(&lc->cc)) << k;
++    return ffe_hevc_bypass_sign(lc->ffe, get_cabac_bypass_sign(&lc->cc, -ret));
+ }
+ 
+ static av_always_inline int mvd_sign_flag_decode(HEVCLocalContext *lc)
+ {
+-    return get_cabac_bypass_sign(&lc->cc, -1);
++    return ffe_hevc_bypass_sign(lc->ffe, get_cabac_bypass_sign(&lc->cc, -1));
+ }
+ 
+ int ff_hevc_split_transform_flag_decode(HEVCLocalContext *lc, int log2_trafo_size)
+@@ -904,10 +905,10 @@ static av_always_inline int last_significant_coeff_suffix_decode(HEVCLocalContex
+ {
+     int i;
+     int length = (last_significant_coeff_prefix >> 1) - 1;
+-    int value = get_cabac_bypass(&lc->cc);
++    int value = ffe_hevc_bypass(lc->ffe, get_cabac_bypass(&lc->cc));
+ 
+     for (i = 1; i < length; i++)
+-        value = (value << 1) | get_cabac_bypass(&lc->cc);
++        value = (value << 1) | ffe_hevc_bypass(lc->ffe, get_cabac_bypass(&lc->cc));
+     return value;
+ }
+ 
+@@ -955,12 +956,12 @@ static av_always_inline int coeff_abs_level_remaining_decode(HEVCLocalContext *l
+     int last_coeff_abs_level_remaining;
+     int i;
+ 
+-    while (prefix < CABAC_MAX_BIN && get_cabac_bypass(&lc->cc))
++    while (prefix < CABAC_MAX_BIN && ffe_hevc_bypass(lc->ffe, get_cabac_bypass(&lc->cc)))
+         prefix++;
+ 
+     if (prefix < 3) {
+         for (i = 0; i < rc_rice_param; i++)
+-            suffix = (suffix << 1) | get_cabac_bypass(&lc->cc);
++            suffix = (suffix << 1) | ffe_hevc_bypass(lc->ffe, get_cabac_bypass(&lc->cc));
+         last_coeff_abs_level_remaining = (prefix << rc_rice_param) + suffix;
+     } else {
+         int prefix_minus3 = prefix - 3;
+@@ -971,7 +972,7 @@ static av_always_inline int coeff_abs_level_remaining_decode(HEVCLocalContext *l
+         }
+ 
+         for (i = 0; i < prefix_minus3 + rc_rice_param; i++)
+-            suffix = (suffix << 1) | get_cabac_bypass(&lc->cc);
++            suffix = (suffix << 1) | ffe_hevc_bypass(lc->ffe, get_cabac_bypass(&lc->cc));
+         last_coeff_abs_level_remaining = (((1 << prefix_minus3) + 3 - 1)
+                                               << rc_rice_param) + suffix;
+     }
+@@ -984,7 +985,7 @@ static av_always_inline int coeff_sign_flag_decode(HEVCLocalContext *lc, uint8_t
+     int ret = 0;
+ 
+     for (i = 0; i < nb; i++)
+-        ret = (ret << 1) | get_cabac_bypass(&lc->cc);
++        ret = (ret << 1) | ffe_hevc_bypass(lc->ffe, get_cabac_bypass(&lc->cc));
+     return ret;
+ }
+ 
+@@ -1500,8 +1501,11 @@ void ff_hevc_hls_residual_coding(HEVCLocalContext *lc, int x0, int y0,
+ 
+ void ff_hevc_hls_mvd_coding(HEVCLocalContext *lc, int x0, int y0, int log2_cb_size)
+ {
+-    int x = abs_mvd_greater0_flag_decode(lc);
+-    int y = abs_mvd_greater0_flag_decode(lc);
++    int x, y;
++
++    ffe_hevc_mvd_start(lc, ABS_MVD_GREATER0_FLAG_OFFSET, ABS_MVD_GREATER1_FLAG_OFFSET + 1);
++    x = abs_mvd_greater0_flag_decode(lc);
++    y = abs_mvd_greater0_flag_decode(lc);
+ 
+     if (x)
+         x += abs_mvd_greater1_flag_decode(lc);
+@@ -1519,5 +1523,6 @@ void ff_hevc_hls_mvd_coding(HEVCLocalContext *lc, int x0, int y0, int log2_cb_si
+     case 1: lc->pu.mvd.y = mvd_sign_flag_decode(lc); break;
+     case 0: lc->pu.mvd.y = 0;                       break;
+     }
++    ffe_hevc_mvd_end(lc);
+ }
+ 
+diff --git a/libavcodec/hevcdec.c b/libavcodec/hevcdec.c
+index 575836e..96b8ecd 100644
+--- a/libavcodec/hevcdec.c
++++ b/libavcodec/hevcdec.c
+@@ -1892,6 +1892,7 @@ static void hevc_luma_mv_mvp_mode(HEVCLocalContext *lc, int x0, int y0, int nPbW
+         mvp_flag = ff_hevc_mvp_lx_flag_decode(lc);
+         ff_hevc_luma_mv_mvp_mode(lc, x0, y0, nPbW, nPbH, log2_cb_size,
+                                  part_idx, merge_idx, mv, mvp_flag, 0);
++        ffe_hevc_mvd(lc, 0, mv->mv[0].x, mv->mv[0].y, &lc->pu.mvd);
+         mv->mv[0].x += lc->pu.mvd.x;
+         mv->mv[0].y += lc->pu.mvd.y;
+     }
+@@ -1900,8 +1901,11 @@ static void hevc_luma_mv_mvp_mode(HEVCLocalContext *lc, int x0, int y0, int nPbW
+         if (s->sh.nb_refs[L1])
+             mv->ref_idx[1]= ff_hevc_ref_idx_lx_decode(lc, s->sh.nb_refs[L1]);
+ 
++        int mvd_coded = 1;
++
+         if (s->sh.mvd_l1_zero_flag == 1 && inter_pred_idc == PRED_BI) {
+             AV_ZERO32(&lc->pu.mvd);
++            mvd_coded = 0;
+         } else {
+             ff_hevc_hls_mvd_coding(lc, x0, y0, 1);
+         }
+@@ -1910,6 +1914,9 @@ static void hevc_luma_mv_mvp_mode(HEVCLocalContext *lc, int x0, int y0, int nPbW
+         mvp_flag = ff_hevc_mvp_lx_flag_decode(lc);
+         ff_hevc_luma_mv_mvp_mode(lc, x0, y0, nPbW, nPbH, log2_cb_size,
+                                  part_idx, merge_idx, mv, mvp_flag, 1);
++        /* an inferred zero mvd has no bins to edit */
++        if (mvd_coded)
++            ffe_hevc_mvd(lc, 1, mv->mv[1].x, mv->mv[1].y, &lc->pu.mvd);
+         mv->mv[1].x += lc->pu.mvd.x;
+         mv->mv[1].y += lc->pu.mvd.y;
+     }
+@@ -2561,6 +2568,7 @@ static int hls_decode_entry(AVCodecContext *avctxt, void *arg)
+             s->tab_slice_address[ctb_addr_rs] = -1;
+             return ret;
+         }
++        ffe_hevc_ctb_start(lc, x_ctb, y_ctb);
+ 
+         hls_sao_param(lc, x_ctb >> s->ps.sps->log2_ctb_size, y_ctb >> s->ps.sps->log2_ctb_size);
+ 
+@@ -2875,6 +2883,7 @@ static int hevc_frame_start(HEVCContext *s)
+     ret = ff_hevc_set_new_ref(s, &s->frame, s->poc);
+     if (ret < 0)
+         goto fail;
++    ffe_hevc_frame_start(s);
+ 
+     ret = ff_hevc_frame_rps(s);
+     if (ret < 0) {
+@@ -2941,6 +2950,8 @@ static int hevc_frame_end(HEVCContext *s)
+     const AVFilmGrainParams *fgp;
+     av_unused int ret;
+ 
++    ffe_hevc_frame_end(s);
++
+     if (out->needs_fg) {
+         av_assert0(out->frame_grain->buf[0]);
+         fgp = av_film_grain_params_select(out->frame);
+@@ -3071,6 +3082,7 @@ static int decode_nal_unit(HEVCContext *s, const H2645NAL *nal)
+             }
+ 
+             s->overlap ++;
++            ffe_hevc_check_slice(s);
+             ret = hevc_frame_start(s);
+             if (ret < 0)
+                 return ret;
+@@ -3221,10 +3233,13 @@ static int decode_nal_units(HEVCContext *s, const uint8_t *buf, int length)
+ 
+         if (s->avctx->skip_frame >= AVDISCARD_ALL ||
+             (s->avctx->skip_frame >= AVDISCARD_NONREF
+-            && ff_hevc_nal_is_nonref(nal->type)) || nal->nuh_layer_id > 0)
++            && ff_hevc_nal_is_nonref(nal->type)) || nal->nuh_layer_id > 0) {
++            ffe_hevc_nal_done(s, nal);
+             continue;
++        }
+ 
+         ret = decode_nal_unit(s, nal);
++        ffe_hevc_nal_done(s, nal);
+         if (ret >= 0 && s->overlap > 2)
+             ret = AVERROR_INVALIDDATA;
+         if (ret < 0) {
+@@ -3337,8 +3352,8 @@ static int hevc_decode_extradata(HEVCContext *s, uint8_t *buf, int length, int f
+     return 0;
+ }
+ 
+-static int hevc_decode_frame(AVCodecContext *avctx, AVFrame *rframe,
+-                             int *got_output, AVPacket *avpkt)
++static int hevc_decode_frame_internal(AVCodecContext *avctx, AVFrame *rframe,
++                                      int *got_output, AVPacket *avpkt)
+ {
+     int ret;
+     uint8_t *sd;
+@@ -3441,11 +3456,30 @@ static int hevc_ref_frame(HEVCFrame *dst, HEVCFrame *src)
+     return 0;
+ }
+ 
++/* ffedit: every non-empty packet yields one output packet, rebuilt
++ * NAL by NAL in decode_nal_units() */
++static int hevc_decode_frame(AVCodecContext *avctx, AVFrame *rframe,
++                             int *got_output, AVPacket *avpkt)
++{
++    HEVCContext *s = avctx->priv_data;
++    int ret;
++
++    if (!avpkt->size)
++        return hevc_decode_frame_internal(avctx, rframe, got_output, avpkt);
++
++    ffe_hevc_packet_start(s, avpkt);
++    ret = hevc_decode_frame_internal(avctx, rframe, got_output, avpkt);
++    ffe_hevc_packet_end(s, avpkt);
++
++    return ret;
++}
++
+ static av_cold int hevc_decode_free(AVCodecContext *avctx)
+ {
+     HEVCContext       *s = avctx->priv_data;
+     int i;
+ 
++    ffe_hevc_uninit(s);
+     pic_arrays_free(s);
+ 
+     ff_dovi_ctx_unref(&s->dovi_ctx);
+@@ -3499,6 +3533,7 @@ static av_cold int hevc_init_context(AVCodecContext *avctx)
+         return AVERROR(ENOMEM);
+     s->HEVClc->parent = s;
+     s->HEVClc->logctx = avctx;
++    s->HEVClc->ffe = &s->ffe;
+     s->HEVClc->common_cabac_state = &s->cabac;
+     s->HEVClcList[0] = s->HEVClc;
+ 
+@@ -3711,7 +3746,10 @@ const FFCodec ff_hevc_decoder = {
+     .flush                 = hevc_decode_flush,
+     UPDATE_THREAD_CONTEXT(hevc_update_thread_context),
+     .p.capabilities        = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_DELAY |
+-                             AV_CODEC_CAP_SLICE_THREADS | AV_CODEC_CAP_FRAME_THREADS,
++                             AV_CODEC_CAP_SLICE_THREADS | AV_CODEC_CAP_FRAME_THREADS |
++                             AV_CODEC_CAP_FFEDIT_BITSTREAM,
++    .p.ffedit_features     = (1 << FFEDIT_FEAT_MV)
++                           | (1 << FFEDIT_FEAT_MV_DELTA),
+     .caps_internal         = FF_CODEC_CAP_EXPORTS_CROPPING |
+                              FF_CODEC_CAP_ALLOCATE_PROGRESS | FF_CODEC_CAP_INIT_CLEANUP,
+     .p.profiles            = NULL_IF_CONFIG_SMALL(ff_hevc_profiles),
+diff --git a/libavcodec/hevcdec.h b/libavcodec/hevcdec.h
+index e65a618..1408536 100644
+--- a/libavcodec/hevcdec.h
++++ b/libavcodec/hevcdec.h
+@@ -42,6 +42,7 @@
+ #include "h274.h"
+ #include "threadframe.h"
+ #include "videodsp.h"
++#include "ffedit_hevc.h"
+ 
+ #define SHIFT_CTB_WPP 2
+ 
+@@ -389,6 +390,9 @@ typedef struct HEVCLocalContext {
+     void *logctx;
+     const struct HEVCContext *parent;
+ 
++    /* ffedit: NULL on slice-thread contexts, which are refused */
++    FFEditHEVCContext *ffe;
++
+     GetBitContext gb;
+     CABACContext cc;
+ 
+@@ -546,6 +550,9 @@ typedef struct HEVCContext {
+ 
+     AVBufferRef *rpu_buf;       ///< 0 or 1 Dolby Vision RPUs.
+     DOVIContext dovi_ctx;       ///< Dolby Vision decoding context
++
++    /* ffedit */
++    FFEditHEVCContext ffe;
+ } HEVCContext;
+ 
+ /**
+diff --git a/libavformat/hevcdec.c b/libavformat/hevcdec.c
+index 255f03b..565b245 100644
+--- a/libavformat/hevcdec.c
++++ b/libavformat/hevcdec.c
+@@ -61,4 +61,5 @@ static int hevc_probe(const AVProbeData *p)
+     return 0;
+ }
+ 
+-FF_DEF_RAWVIDEO_DEMUXER(hevc, "raw HEVC video", hevc_probe, "hevc,h265,265", AV_CODEC_ID_HEVC)
++FF_DEF_RAWVIDEO_DEMUXER2(hevc, "raw HEVC video", hevc_probe, "hevc,h265,265",
++                         AV_CODEC_ID_HEVC, AVFMT_GENERIC_INDEX | AVFMT_FFEDIT_BITSTREAM | AVFMT_FFEDIT_RAWSTREAM)
+diff --git a/libavutil/json.h b/libavutil/json.h
+index 2d46fc0..6b30a5e 100644
+--- a/libavutil/json.h
++++ b/libavutil/json.h
+@@ -47,7 +47,7 @@ typedef struct {
+     void *userdata;
+ } json_arr_t;
+ 
+-#define MAX_MV2DARRAY_NBLOCKS 16
++#define MAX_MV2DARRAY_NBLOCKS 128
+ #define MV_NULL 0x80000000
+ typedef struct {
+     int32_t *mvs[MAX_MV2DARRAY_NBLOCKS];
+-- 
+2.55.0
+

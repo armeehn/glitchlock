@@ -448,7 +448,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("prepare", help="transcode any video into a glitchable carrier")
     p.add_argument("input")
     p.add_argument("-o", "--output", required=True)
-    p.add_argument("--codec", default="mpeg2video", choices=["mpeg2video", "mpeg4", "h264"])
+    p.add_argument("--codec", default="mpeg2video", choices=["mpeg2video", "mpeg4", "h264", "hevc"])
     p.add_argument("--qscale", type=int, default=6)
     p.add_argument("--gop", type=int, default=25)
     p.add_argument("--closed-gop", action="store_true",

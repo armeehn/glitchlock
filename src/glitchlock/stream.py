@@ -158,8 +158,13 @@ VOS_HEADER = b"\x00\x00\x01\xb0"
 #: repeat-headers every IDR access unit opens with one, so it marks a GOP.
 SPS_HEADER = b"\x00\x00\x00\x01\x67"
 
+#: Annex B start code + VPS NAL header (type 32, layer 0, tid 1). x265's
+#: repeat-headers puts one before every IDR, so it marks a GOP.
+VPS_HEADER = b"\x00\x00\x00\x01\x40\x01"
+
 MARKERS = {
     "h264": SPS_HEADER,
+    "hevc": VPS_HEADER,
     "mpeg2video": SEQUENCE_HEADER,
     "mpeg1video": SEQUENCE_HEADER,
     "mpeg4": VOS_HEADER,

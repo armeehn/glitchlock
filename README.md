@@ -105,11 +105,13 @@ If FFglitch lives somewhere unusual, point at it with
 Stock FFglitch exposes nothing reversible for H.264/HEVC. `prepare` transcodes
 to a glitchable MPEG-2 or MPEG-4 elementary stream using the standard FFglitch
 encoder recipe (`+nopimb+forcemv`, so every macroblock carries a real vector),
-or to H.264 when the patched `ffedit` from [ffglitch/](ffglitch/) is on PATH.
+or to H.264 or HEVC when the patched `ffedit` from [ffglitch/](ffglitch/) is
+on PATH.
 
 ```console
 $ glitchlock prepare input.mkv -o carrier.mpg --codec mpeg2video --qscale 6 --gop 25
 $ glitchlock prepare input.mkv -o carrier.264 --codec h264 --gop 25 --closed-gop
+$ glitchlock prepare input.mkv -o carrier.265 --codec hevc --gop 25 --closed-gop
 ```
 
 The H.264 carrier is Main profile with CAVLC entropy coding and two B-frames,
@@ -120,6 +122,13 @@ streams are refused, not corrupted. Scrambled vectors stay within ±512 px,
 the Level 3.1 vertical range, so hardware decoders still play the result.
 Building the patched FFglitch: `ffglitch/build.sh /tmp/ffg /opt/ffglitch-h264`
 (see `ffglitch/NOTES.md`).
+
+The HEVC carrier is Main (or Main 10) with two B-frames from libx265, CRF 23,
+without wavefront parallel processing. HEVC has no CAVLC, so an edited vector
+cannot be dropped into the bitstream: the patched `ffedit` logs every CABAC
+bin the decoder reads, swaps the bins of each scrambled vector and re-encodes
+the slice. Unlocking re-encodes it back to x265's exact bytes. Streams with
+WPP, tiles or PCM are refused, not corrupted.
 
 This step is lossy and drops audio — it is a transcode. **The carrier is the
 plaintext.** Everything after this point is bit-exact.

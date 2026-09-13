@@ -1,4 +1,4 @@
-# FFglitch 0.10.2 + H.264 CAVLC motion-vector editing
+# FFglitch 0.10.2 + H.264 / HEVC motion-vector editing
 
 Patches on top of the pristine `ffglitch-0.10.2.tar.xz` tree that let
 `ffedit` export and re-apply H.264 motion vectors for CAVLC streams.
@@ -6,6 +6,7 @@ Patches on top of the pristine `ffglitch-0.10.2.tar.xz` tree that let
     0001  Add direction-only mv export helpers      (ffedit_mv, json.h)
     0002  Add H.264 CAVLC mvd hooks to ffedit       (the feature)
     0003  Enable ffedit for raw H.264 streams       (demuxer flag, codec caps)
+    0004  Add HEVC mvd hooks to ffedit              (CABAC re-encoding, see below)
 
 `build.sh` reproduces the build; `mvtest.py` is the round-trip test.
 
@@ -154,7 +155,6 @@ CABAC refusal (`cabac.264`, High profile):
 
 * CABAC (High profile default), interlaced/field/MBAFF, AVCC input
   (MP4/MKV): refused when an mv feature is requested.
-* HEVC: untouched.
 * Only mvd is editable. mb_type, ref_idx, residuals, skip runs stay
   as they are, so the slot layout is fixed by the input stream.
 * `mv` values must stay in `int16` once added to the prediction; the
@@ -177,3 +177,80 @@ CABAC refusal (`cabac.264`, High profile):
   no nasm; the bundled Xvid encoder (used by ffgac's libxvid) is
   therefore absent from this build. Everything else matches the
   upstream 0.10.2 configuration minus SDL/xcb/drm (fflive not built).
+
+## HEVC (patch 0004, 2026-09-13)
+
+    0004  Add HEVC mvd hooks to ffedit by CABAC re-encoding
+
+Same features and JSON layout as H.264, on raw Annex B HEVC
+(`-f hevc`, `.265/.hevc`). The "macroblock" grid is the CTB grid
+(16, 32 or 64 px per cell) and a cell holds up to `2 * (ctb/8)^2`
+vectors per list, in decode order, so `MAX_MV2DARRAY_NBLOCKS` is 128.
+
+    ffedit -i in.265 -f mv       -e mv.json
+    ffedit -i in.265 -f mv       -a mv.json -o out.265
+    ffedit -i in.265 -f mv_delta -e mvd.json
+    ffedit -i in.265 -o copy.265                    # bit-exact copy
+
+### Why re-encode
+
+HEVC has no CAVLC. Every slice is CABAC, and the arithmetic coder's
+registers after a bin depend on every bin before it, so a changed mvd
+changes every following bit of the slice. There is no in-place edit.
+
+    decoder:  bin bin bin [mvd bins] bin bin ... end_of_slice_segment
+                |   |   |    |
+                v   v   v    v
+    log:      (ctx,b)(ctx,b)(bypass,b) ...          ffedit_hevc.c
+
+`hevc_cabac.c` funnels every read through four shapes (`GET_CABAC`,
+`get_cabac_bypass`, `get_cabac_bypass_sign`, `get_cabac_terminate`);
+each is wrapped to append (kind, context, bin) to a per-slice log.
+`ff_hevc_hls_mvd_coding()` marks the log range of its group, and the
+override point in `hevc_luma_mv_mvp_mode()` (after the predictor is
+known, before it is added) splices in the binarisation of the new mvd:
+greater0 x/y, greater1 x/y, then per axis EG1 `abs_mvd_minus2` and the
+sign, all as the decoder reads them. Context selection never depends
+on an mvd value, so nothing after the group changes meaning.
+
+At `ffe_hevc_nal_done()` an edited slice is rebuilt: slice header bytes
+copied up to the CABAC data offset (captured in `ff_hevc_cabac_init()`
+together with the initial context states), the log replayed through a
+CABAC encoder (the one from `libavcodec/tests/cabac.c`, with
+`firstBitFlag` made explicit), the terminate bin's trailing `|1` is the
+rbsp_stop_one_bit, zero-align, re-escape. That encoder reproduces
+x265's bytes exactly: applying the original JSON onto an edited stream
+gives back the original file.
+
+Unedited slices are copied raw, so cabac_zero_words or non-canonical
+escapes in the source only matter for slices that were edited.
+
+### Verified (2026-09-13, LXC 111, x265 4.2)
+
+`rt.py`-style round trip on 20 encoder configurations: edit every
+vector to a random value, apply, re-export (all vectors identical),
+decode (0 errors), apply the original JSON, compare bytes (identical).
+Configurations: bframes 0/2/3/4, B-pyramid, ref 4, CTB 16/32/64, AMP +
+rect, `--rd 6`, weighted P and B, SAO off, sign hiding and RDOQ off,
+lossless CUs, transform skip at qp 12, qp 45, open GOP, aq-mode 3 with
+cutree off, max-merge 1, no temporal MVP, intra refresh, 318x182,
+1280x720 qp 10 (33 509 vectors), a 1 MB mandelbrot at qp 8, preset
+veryslow, Main 10. Targets across the full int16 range and the
+`mv_delta` feature also round-trip.
+
+### Refused
+
+WPP (`entropy_coding_sync_enabled_flag`, x265's default, so carriers
+are made with `wpp=0`), tiles, dependent slice segments, PCM, CABAC
+bypass alignment, hvcC input, more than one decoding thread. A plain
+copy of such a file still works.
+
+### Known limits
+
+* Multiple slices per picture are handled per NAL but untested: x265
+  refuses `--slices` without WPP, and WPP is refused here.
+* `mv` targets outside int16 wrap (the decoder adds in int16); a
+  warning is printed once.
+* An inferred mvd (`mvd_l1_zero_flag` on a bi-predicted PU) has no
+  bins and is not a slot.
+* Slice threading (`hls_decode_entry_wpp`) never sees the hooks.
