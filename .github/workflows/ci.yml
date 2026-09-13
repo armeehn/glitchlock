@@ -30,7 +30,7 @@ jobs:
         run: |
           git init -q .
           git fetch -q --depth 1 \
-            "https://oauth2:${TOKEN}@${GITHUB_SERVER_URL#https://}/${GITHUB_REPOSITORY}.git" \
+            "https://x-access-token:${TOKEN}@${GITHUB_SERVER_URL#https://}/${GITHUB_REPOSITORY}.git" \
             "$GITHUB_SHA"
           git checkout -q FETCH_HEAD
       - run: pip install -e ".[recipients]" pytest
@@ -53,7 +53,7 @@ jobs:
         run: |
           git init -q .
           git fetch -q --depth 1 \
-            "https://oauth2:${TOKEN}@${GITHUB_SERVER_URL#https://}/${GITHUB_REPOSITORY}.git" \
+            "https://x-access-token:${TOKEN}@${GITHUB_SERVER_URL#https://}/${GITHUB_REPOSITORY}.git" \
             "$GITHUB_SHA"
           git checkout -q FETCH_HEAD
       - name: install FFglitch (patched for H.264 and HEVC, static build)
@@ -64,7 +64,8 @@ jobs:
         # ffglitch.org zip would make the H.264/HEVC tests skip, and the no-skip
         # rule below would then fail the job, which is the right outcome.
         env:
-          API: ${{ github.server_url }}/api/v1/repos/${{ github.repository }}
+          # GitHub's API lives on its own host; Gitea's under the server URL.
+          API: ${{ contains(github.server_url, 'github.com') && 'https://api.github.com' || format('{0}/api/v1', github.server_url) }}/repos/${{ github.repository }}
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           # H.264 and HEVC carriers are made by the system ffmpeg (libx264,

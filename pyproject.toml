@@ -7,10 +7,14 @@ name = "glitchlock"
 version = "1.0.0"
 description = "Reversible, keyed bitstream scrambling for video, built on FFglitch"
 readme = "README.md"
+authors = [{ name = "Sasha Zero", email = "sasha@ripostelabs.xyz" }]
 requires-python = ">=3.9"
 license = { text = "MIT" }
 keywords = ["ffglitch", "datamosh", "glitch", "video", "bitstream", "reversible"]
 classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Other Audience",
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: MIT License",
     "Topic :: Multimedia :: Video",
@@ -28,6 +32,7 @@ glitchlock = "glitchlock.cli:main"
 [project.urls]
 Homepage = "https://github.com/armeehn/glitchlock"
 Issues = "https://github.com/armeehn/glitchlock/issues"
+Changelog = "https://github.com/armeehn/glitchlock/blob/main/CHANGELOG.md"
 
 [tool.setuptools.packages.find]
 where = ["src"]

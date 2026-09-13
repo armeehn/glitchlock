@@ -520,8 +520,8 @@ mb incr damaged</pre>
   <footer class="foot">
     <p><strong style="color:var(--ink);font-weight:400">Glitchlock</strong> &middot; reversible,
     keyed bitstream scrambling built on <a href="https://ffglitch.org">FFglitch</a> 0.10.2.
-    Source: <code>github.com/armeehn/glitchlock</code> (private repository). 59 tests pass from a
-    clean clone, including byte-exact round trips on MPEG-2 and MPEG-4.</p>
+    Source: <code>github.com/armeehn/glitchlock</code>. 259 tests pass from a clean clone,
+    including byte-exact round trips on MPEG-2, MPEG-4, H.264, HEVC and MP2.</p>
     <p>This is a keyed reversible scrambler, not confidentiality. The ciphertext is a playable
     video and leaks its own content &mdash; the residual picture survives. For secrecy, encrypt the
     file with a real AEAD tool instead.</p>

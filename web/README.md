@@ -1,8 +1,8 @@
 # glitchlock web service
 
-The front end at `glitchlock.hq.ripostelabs.xyz`. Until 2026-09-09 these files
-existed only on the container that runs them and were in no repository, so a
-rebuild of that container would have lost them.
+The web front end. Until 2026-09-09 these files existed only on the host that
+runs them and were in no repository, so a rebuild of that host would have lost
+them.
 
 ## Layout
 
@@ -11,18 +11,16 @@ rebuild of that container would have lost them.
 | `server.py` | The whole service. Standard-library HTTP server, no framework. |
 | `static/index.html` | The UI. Vanilla JS, no build step. |
 | `static/bench.html` | The self-contained proof bench served at `/bench`. |
-| `static/riposte-brand.css` | Brand CSS, vendored from the apps host (LXC 104). |
+| `static/riposte-brand.css` | Brand CSS, vendored from [riposte-brand](https://github.com/armeehn/riposte-brand). |
 | `static/fonts/` | JetBrains Mono subsets, vendored from the same place, under `OFL-1.1.txt`. |
 | `glitchlock.service` | The systemd unit as deployed. |
-| `checks/` | The proof battery. See `checks/README.md`. |
 
 Nothing here is installed by `pip`. The package in `src/` is installed into the
 venv; these files are copied to `/opt/glitchlock/` separately. That split is
 deliberate and easy to forget: **`pip install` does not update the server.**
 
-The CSS and fonts are vendored because no CDN is reachable from the estate
-network. They are a second copy of what lives on the apps host, so they can
-drift.
+The CSS and fonts are vendored because the service is meant to run without
+reaching any CDN. They are a second copy of the brand repo, so they can drift.
 
 ## Deploying
 
