@@ -68,7 +68,9 @@ def test_wpp_carrier_is_refused_not_corrupted(tmp_path):
         check=True, capture_output=True)
     subprocess.run(
         ["ffmpeg", "-v", "error", "-y", "-i", src, "-c:v", "libx265",
-         "-x265-params", "wpp=1:log-level=error", "-f", "hevc", out],
+         # pools=2: without an explicit pool x265 drops WPP in a container
+         # ("No thread pool allocated, --wpp disabled") and nothing is refused
+         "-x265-params", "wpp=1:pools=2:log-level=error", "-f", "hevc", out],
         check=True, capture_output=True)
     if ffg.codec_name(out) != "hevc":
         pytest.skip("ffedit without HEVC support (stock FFglitch 0.10.2)")
