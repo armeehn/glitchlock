@@ -159,6 +159,39 @@ def _transcode_h264(src: str, dst: str, gop: int, closed_gop: bool,
     _run(cmd)
 
 
+#: x265 quality for an HEVC carrier, same scale as the H.264 one.
+HEVC_CRF = 23
+#: B-frames per GOP in the HEVC carrier.
+HEVC_BFRAMES = 2
+
+
+def _transcode_hevc(src: str, dst: str, gop: int, closed_gop: bool,
+                    extra: Optional[List[str]]) -> None:
+    """HEVC carrier through the system ffmpeg's libx265. The patched ffedit
+    re-encodes CABAC, so entropy coding is not a constraint, but wavefront
+    parallel processing is refused (its per-row context saves would have to
+    be replayed) and x265 turns it on by default. Repeated VPS/SPS/PPS give
+    every IDR a splittable start code for streaming."""
+    params = [
+        "wpp=0", f"bframes={HEVC_BFRAMES}", "repeat-headers=1",
+        f"keyint={gop}", f"min-keyint={gop}", "log-level=error",
+    ]
+    if closed_gop:
+        params += ["scenecut=0", "open-gop=0"]
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise FFglitchMissing("an HEVC carrier needs ffmpeg with libx265 on PATH")
+    cmd = [
+        ffmpeg, "-v", "error", "-y", "-i", src, "-an",
+        "-c:v", "libx265", "-crf", str(HEVC_CRF),
+        "-x265-params", ":".join(params), "-f", "hevc",
+    ]
+    if extra:
+        cmd += extra
+    cmd.append(dst)
+    _run(cmd)
+
+
 def transcode(
     src: str,
     dst: str,
@@ -180,6 +213,9 @@ def transcode(
     """
     if codec == "h264":
         _transcode_h264(src, dst, gop, closed_gop, extra)
+        return
+    if codec == "hevc":
+        _transcode_hevc(src, dst, gop, closed_gop, extra)
         return
     cmd = [
         ffgac_path(), "-v", "error", "-y", "-i", src, "-an",
