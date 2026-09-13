@@ -11,14 +11,28 @@ jobs:
     # Unit tests need no FFglitch and no video: they prove the transform is a
     # bijection on synthetic FFedit-shaped payloads.
     runs-on: ubuntu-latest
+    # The interpreter comes from the image, not from actions/setup-python.
+    # On the self-hosted runner two jobs starting together race on that
+    # action's cache directory (one copies it while the other re-checks it
+    # out) and fail with "lstat .../eslint.config.mjs: no such file"; three
+    # matrix legs starting at once hit it on most runs.
+    container: python:${{ matrix.python }}
     strategy:
       matrix:
         python: ["3.9", "3.11", "3.13"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python }}
+      - name: checkout
+        # Plain git rather than actions/checkout: that action needs node,
+        # which the python image lacks, and it shares the action cache
+        # race described above. Gitea serves any reachable SHA.
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git init -q .
+          git fetch -q --depth 1 \
+            "https://oauth2:${TOKEN}@${GITHUB_SERVER_URL#https://}/${GITHUB_REPOSITORY}.git" \
+            "$GITHUB_SHA"
+          git checkout -q FETCH_HEAD
       - run: pip install -e ".[recipients]" pytest
       - run: pytest tests/test_transform.py tests/test_crypto.py tests/test_stream.py tests/test_pubkey.py -v
 
@@ -26,15 +40,26 @@ jobs:
     # The real proof: byte-exact round trips through actual MPEG-2, MPEG-4
     # and H.264 bitstreams, using the FFglitch binaries.
     runs-on: ubuntu-latest
+    # Same image as the unit job, for the same reason. It is Debian, so
+    # its ffmpeg carries libx264 and libx265, and the job runs as root.
+    container: python:3.11
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+      - name: checkout
+        # Plain git rather than actions/checkout: that action needs node,
+        # which the python image lacks, and it shares the action cache
+        # race described above. Gitea serves any reachable SHA.
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git init -q .
+          git fetch -q --depth 1 \
+            "https://oauth2:${TOKEN}@${GITHUB_SERVER_URL#https://}/${GITHUB_REPOSITORY}.git" \
+            "$GITHUB_SHA"
+          git checkout -q FETCH_HEAD
       - name: install FFglitch (patched for H.264 and HEVC, static build)
         # Built by ffglitch/build.sh with STATIC=1 and published as a release
         # asset on this repo. Static because a binary built on Arch wants a
-        # newer glibc than this runner image has; a release asset because a
+        # newer glibc than this image has; a release asset because a
         # from-source build takes longer than the rest of the job. The stock
         # ffglitch.org zip would make the H.264/HEVC tests skip, and the no-skip
         # rule below would then fail the job, which is the right outcome.
@@ -44,15 +69,15 @@ jobs:
         run: |
           # H.264 and HEVC carriers are made by the system ffmpeg (libx264,
           # libx265); ffgac has neither encoder.
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq ffmpeg
+          apt-get update -qq
+          apt-get install -y -qq ffmpeg xz-utils
           url=$(curl -sSf -H "Authorization: token $TOKEN" \
             "$API/releases/tags/ffglitch-hevc-1" \
             | python3 -c 'import sys,json; print(json.load(sys.stdin)["assets"][0]["browser_download_url"])')
           curl -sSfL -H "Authorization: token $TOKEN" -o ffglitch.tar.xz "$url"
           echo "c49eb7e34f299b0e043c26a813de2009fcd05471d2117a02e80717a9bf9208a9  ffglitch.tar.xz" | sha256sum -c
-          sudo tar -xJf ffglitch.tar.xz -C /opt
-          sudo mv /opt/ffglitch-0.10.2-hevc /opt/ffglitch
+          tar -xJf ffglitch.tar.xz -C /opt
+          mv /opt/ffglitch-0.10.2-hevc /opt/ffglitch
           echo "/opt/ffglitch" >> "$GITHUB_PATH"
       # No pipe here. `ffedit -version | head -1` reports head's exit status,
       # so a completely non-functional ffedit passed this check silently and
