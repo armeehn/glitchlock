@@ -28,6 +28,9 @@ jobs:
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # GitHub mounts the workspace owned by another uid; git refuses
+          # to touch it from root without this.
+          git config --global --add safe.directory "*"
           git init -q .
           git fetch -q --depth 1 \
             "https://x-access-token:${TOKEN}@${GITHUB_SERVER_URL#https://}/${GITHUB_REPOSITORY}.git" \
@@ -51,6 +54,9 @@ jobs:
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # GitHub mounts the workspace owned by another uid; git refuses
+          # to touch it from root without this.
+          git config --global --add safe.directory "*"
           git init -q .
           git fetch -q --depth 1 \
             "https://x-access-token:${TOKEN}@${GITHUB_SERVER_URL#https://}/${GITHUB_REPOSITORY}.git" \
