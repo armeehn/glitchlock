@@ -7,6 +7,7 @@ Patches on top of the pristine `ffglitch-0.10.2.tar.xz` tree that let
     0002  Add H.264 CAVLC mvd hooks to ffedit       (the feature)
     0003  Enable ffedit for raw H.264 streams       (demuxer flag, codec caps)
     0004  Add HEVC mvd hooks to ffedit              (CABAC re-encoding, see below)
+    0005  Add H.264 CAVLC q_sign feature to ffedit   (residual signs, see below)
 
 `build.sh` reproduces the build; `mvtest.py` is the round-trip test.
 
@@ -155,8 +156,9 @@ CABAC refusal (`cabac.264`, High profile):
 
 * CABAC (High profile default), interlaced/field/MBAFF, AVCC input
   (MP4/MKV): refused when an mv feature is requested.
-* Only mvd is editable. mb_type, ref_idx, residuals, skip runs stay
-  as they are, so the slot layout is fixed by the input stream.
+* mvd and coefficient signs (patch 0005) are editable. mb_type,
+  ref_idx, |level|, skip runs stay as they are, so the slot layout is
+  fixed by the input stream.
 * `mv` values must stay in `int16` once added to the prediction; the
   decoder stores vectors as int16 and wraps silently beyond that. The
   test range (+-64 quarter-pel) is far from that.
@@ -254,3 +256,54 @@ copy of such a file still works.
 * An inferred mvd (`mvd_l1_zero_flag` on a bi-predicted PU) has no
   bins and is not a slot.
 * Slice threading (`hls_decode_entry_wpp`) never sees the hooks.
+
+## H.264 residual signs (patch 0005, 2026-09-15)
+
+    0005  Add H.264 CAVLC q_sign feature to ffedit
+
+Feature `q_sign`: the sign of every residual coefficient, I, P and B
+macroblocks alike, so intra frames are no longer left in the clear
+(glitchlock docs/adr/0002-intra-residual.md).
+
+    ffedit -i in.264 -f q_sign -e signs.json
+    ffedit -i in.264 -f q_sign -a signs.json -o out.264
+
+JSON per frame: `"q_sign": { "mb": [ row ][ col ] }`, a cell being
+`null` (skipped, or no coefficients) or a list of `0`/`1` (1 =
+negative) in the order `decode_residual()` is called: Intra16x16 DC,
+luma AC or 4x4 blocks, chroma DC, chroma AC. On import only the sign
+is taken from the value (non-zero = negative); a missing entry keeps
+the original.
+
+Where the sign sits in CAVLC (9.2.2.1):
+
+    trailing ones     : trailing_ones_sign_flag, one bit each
+    other levels      : parity of levelCode = 2|level|-2 (+) / 2|level|-1 (-)
+                        (minus 2 for the first level after < 3 T1s)
+
+|level| is never changed, so coeff_token, total_zeros, run_before and
+the suffixLength adaptation are untouched. The code length changes by
+one bit only for suffixLength 0, levelCode < 14 (bare unary prefix);
+the patch 0002 rebuild handles ranges of any length. `put_level()` is
+the spec encoder including the prefix 14/15 suffixes and the >= 16
+escape; x264 is canonical, so re-applying the original signs restores
+the input byte for byte.
+
+Hooks: `decode_residual()` records each level's bit offset and
+suffixLength and calls `ffe_h264_levels()` once per block;
+`ffe_h264_mb_start()` (now given the decoder context) flushes the
+previous macroblock's signs to the JSON, `ffe_h264_nal_done()` the
+last one. `FFEditH264Edit` gained a kind (se(v), raw bits, level).
+Signs per macroblock are capped at 1024 (4:4:4 worst case is 896);
+beyond that a warning is printed and the rest is left alone.
+
+Verified (2026-09-15, LXC 111): glitchlock tests/test_qsign.py, flat
+and noisy (CRF 2) 320x240 carriers, byte-exact unlock, stock ffmpeg
+decodes the locked file with no errors.
+
+Build in LXC 111: `/opt/ffglitch-intra` (patches 0001-0005), from
+`build.sh /home/user/ffglitch-intra-build /opt/ffglitch-intra`.
+`/opt/ffglitch-hevc` (0001-0004) is left in place for the tools that
+point at it; the glitchlock suite runs against the new one with
+`GLITCHLOCK_FFGLITCH_HOME=/opt/ffglitch-intra`. CI asset:
+`ffglitch-intra-1`.

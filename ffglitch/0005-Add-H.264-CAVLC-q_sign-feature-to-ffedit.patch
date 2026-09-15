@@ -1,0 +1,745 @@
+From c03c34d598582b80dbd9250c89da1871a8aa0d3d Mon Sep 17 00:00:00 2001
+From: Sasha Zero <sasha@ripostelabs.xyz>
+Date: Tue, 15 Sep 2026 07:32:27 -0700
+Subject: [PATCH] Add H.264 CAVLC q_sign feature to ffedit
+
+Export and re-apply the sign of every residual coefficient as the
+"q_sign" feature: one 0/1 per non-zero level of each macroblock, in
+the order decode_residual() reads them. Intra macroblocks have no
+motion vectors, so the mv features left every I-frame untouched; the
+signs reach them.
+
+Only the sign moves. |level| is kept, so coeff_token, total_zeros,
+run_before and the suffixLength adaptation do not change and the slot
+layout is fixed by the input stream. A trailing_ones_sign_flag is one
+bit; any other sign is the parity of levelCode, and put_level() is
+the 9.2.2.1 encoder (prefix 14 and 15 suffixes, the >= 16 escape, the
+levelCode - 2 rule for the first level after fewer than three trailing
+ones). Its code length changes only in the bare unary case, which the
+existing NAL rebuild handles.
+
+decode_residual() records each level's bit offset and suffixLength and
+calls ffe_h264_levels() once per block. ffe_h264_mb_start() now takes
+the decoder context and flushes the previous macroblock's signs to the
+JSON; ffe_h264_nal_done() flushes the last one. FFEditH264Edit gained
+a kind (se(v), raw bits, level).
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ libavcodec/ffedit.c      |   4 +
+ libavcodec/ffedit.h      |   1 +
+ libavcodec/ffedit_h264.c | 351 +++++++++++++++++++++++++++++++++++----
+ libavcodec/ffedit_h264.h |  60 +++++--
+ libavcodec/h264_cavlc.c  |  14 +-
+ libavcodec/h264dec.c     |   3 +-
+ 6 files changed, 390 insertions(+), 43 deletions(-)
+
+diff --git a/libavcodec/ffedit.c b/libavcodec/ffedit.c
+index b19bf76..30ed653 100644
+--- a/libavcodec/ffedit.c
++++ b/libavcodec/ffedit.c
+@@ -36,6 +36,7 @@ static const char *const feat_keys[] = {
+     "gmc",
+     "headers",
+     "idat",
++    "q_sign",
+ };
+ 
+ enum FFEditFeature ffe_str_to_feat(const char *str)
+@@ -66,6 +67,7 @@ static const char *const feat_desc[] = {
+     "global motion compensation",
+     "headers",
+     "image data",
++    "quantized coefficient signs",
+ };
+ 
+ const char *ffe_feat_desc(enum FFEditFeature feat)
+@@ -123,6 +125,8 @@ static enum FFEditFeature const feat_excludes[][32] = {
+     { FFEDIT_FEAT_LAST },
+     // FFEDIT_FEAT_IDAT
+     { FFEDIT_FEAT_LAST },
++    // FFEDIT_FEAT_Q_SIGN
++    { FFEDIT_FEAT_LAST },
+ };
+ 
+ int ffe_feat_excludes(enum FFEditFeature feat1, enum FFEditFeature feat2)
+diff --git a/libavcodec/ffedit.h b/libavcodec/ffedit.h
+index 88260ca..60a22e4 100644
+--- a/libavcodec/ffedit.h
++++ b/libavcodec/ffedit.h
+@@ -39,6 +39,7 @@ enum FFEditFeature {
+     FFEDIT_FEAT_GMC,
+     FFEDIT_FEAT_HEADERS,
+     FFEDIT_FEAT_IDAT,
++    FFEDIT_FEAT_Q_SIGN,
+ 
+     FFEDIT_FEAT_LAST
+ };
+diff --git a/libavcodec/ffedit_h264.c b/libavcodec/ffedit_h264.c
+index 55a4293..810613a 100644
+--- a/libavcodec/ffedit_h264.c
++++ b/libavcodec/ffedit_h264.c
+@@ -44,8 +44,9 @@
+ #define MVD_MIN (-32767)
+ #define MVD_MAX ( 32767)
+ 
+-/* upper bound on a rebuilt se(v) code, in bits */
+-#define MAX_SEV_BITS 33
++/* upper bound on a rebuilt code, in bits: a level with the longest
++ * escape prefix (28 zeros, 1, 25 suffix bits) */
++#define MAX_EDIT_BITS 54
+ /* NAL header byte precedes the slice header in the RBSP */
+ #define NAL_HEADER_BITS 8
+ /* longest chunk get_bits() can read at once */
+@@ -54,15 +55,24 @@
+ #define EPB_MAX_FOLLOWING 3
+ 
+ #define FEAT_MASK_MV ((1 << FFEDIT_FEAT_MV) | (1 << FFEDIT_FEAT_MV_DELTA))
++#define FEAT_MASK_SIGN (1 << FFEDIT_FEAT_Q_SIGN)
+ #define FEAT_MASK_OUTPUT (1 << FFEDIT_FEAT_LAST)
+ 
++/* CAVLC level coding (9.2.2.1): suffixLength 0 codes levelCode < 14
++ * as a bare prefix, 14..29 with a 4-bit suffix, the rest with 12 */
++#define LEVEL_PREFIX_SHORT 14
++#define LEVEL_PREFIX_ESCAPE 15
++#define LEVEL_SUFFIX_14 4
++#define LEVEL_SUFFIX_ESCAPE 12
++#define LEVEL_ESCAPE_RANGE (1 << LEVEL_SUFFIX_ESCAPE)
++
+ /*-------------------------------------------------------------------*/
+-int ffe_h264_wants_mv(const AVCodecContext *avctx)
++int ffe_h264_wants_edit(const AVCodecContext *avctx)
+ {
+     uint64_t all = avctx->ffedit_export
+                  | avctx->ffedit_import
+                  | avctx->ffedit_apply;
+-    return (all & FEAT_MASK_MV) != 0;
++    return (all & (FEAT_MASK_MV | FEAT_MASK_SIGN)) != 0;
+ }
+ 
+ /*-------------------------------------------------------------------*/
+@@ -120,6 +130,209 @@ static int out_append_escaped(FFEditH264Context *fe, const uint8_t *rbsp, size_t
+     return ret;
+ }
+ 
++
++/*-------------------------------------------------------------------*/
++/* edit log                                                          */
++/*-------------------------------------------------------------------*/
++static FFEditH264Edit *record_edit(FFEditH264SliceContext *fsl, int pos, int len, int kind, int val)
++{
++    size_t need = (fsl->nb_edits + 1) * sizeof(FFEditH264Edit);
++    void *tmp = av_fast_realloc(fsl->edits, &fsl->edits_alloc, need);
++    FFEditH264Edit *e;
++
++    if ( tmp == NULL )
++        return NULL;
++    fsl->edits = tmp;
++
++    e = &fsl->edits[fsl->nb_edits++];
++    memset(e, 0, sizeof(*e));
++    e->pos = pos;
++    e->len = len;
++    e->kind = kind;
++    e->val = val;
++
++    return e;
++}
++
++/*-------------------------------------------------------------------*/
++/* q_sign: residual coefficient signs                                */
++/*-------------------------------------------------------------------*/
++
++/* the frame payload is { "mb": [ row ][ col ] -> null | [0,1,...] } */
++typedef struct {
++    json_t *mb;
++} sign_ctx;
++
++static void sign_export_init(json_ctx_t *jctx, AVFrame *f, int mb_width, int mb_height)
++{
++    json_t *jframe = json_object_new(jctx);
++    sign_ctx *ctx = json_allocator_get0(jctx, sizeof(sign_ctx));
++
++    json_object_userdata_set(jframe, ctx);
++    ctx->mb = ffe_jblock_new(jctx, mb_width, mb_height, JSON_PFLAGS_NO_LF);
++    json_object_add(jframe, "mb", ctx->mb);
++
++    f->ffedit_sd[FFEDIT_FEAT_Q_SIGN] = jframe;
++}
++
++static void sign_import_init(json_ctx_t *jctx, AVFrame *f)
++{
++    json_t *jframe = f->ffedit_sd[FFEDIT_FEAT_Q_SIGN];
++    sign_ctx *ctx = json_allocator_get0(jctx, sizeof(sign_ctx));
++
++    json_object_userdata_set(jframe, ctx);
++    ctx->mb = json_object_get(jframe, "mb");
++}
++
++/* write the pending macroblock's signs as one array of ints */
++static void sign_flush_mb(H264Context *h, H264SliceContext *sl)
++{
++    FFEditH264SliceContext *fsl = &sl->ffe;
++    AVCodecContext *avctx = h->avctx;
++    int nb = fsl->nb_signs;
++
++    fsl->nb_signs = 0;
++    fsl->jsign_mb = NULL;
++    fsl->jsign_mb_valid = 0;
++
++    if ( nb == 0 || (avctx->ffedit_export & FEAT_MASK_SIGN) == 0 || h->cur_pic_ptr == NULL )
++        return;
++
++    {
++        AVFrame *f = h->cur_pic_ptr->f;
++        json_t *jframe = f->ffedit_sd[FFEDIT_FEAT_Q_SIGN];
++        sign_ctx *ctx;
++        json_t *jarr;
++
++        if ( jframe == NULL )
++            return;
++        ctx = json_object_userdata_get(jframe);
++        jarr = json_array_of_ints_new(f->jctx, nb);
++        json_set_pflags(jarr, JSON_PFLAGS_NO_LF);
++        for ( int i = 0; i < nb; i++ )
++            jarr->array_of_ints[i] = fsl->signs[i];
++        ffe_jblock_set(ctx->mb, fsl->sign_mb_y, fsl->sign_mb_x, jarr);
++    }
++}
++
++/* imported sign for coefficient idx of the current macroblock, or
++ * fallback when the JSON has no value there */
++static int sign_import_get(FFEditH264SliceContext *fsl, AVFrame *f, int idx, int fallback)
++{
++    json_t *jmb;
++
++    if ( !fsl->jsign_mb_valid )
++    {
++        json_t *jframe = f->ffedit_sd[FFEDIT_FEAT_Q_SIGN];
++        sign_ctx *ctx = jframe ? json_object_userdata_get(jframe) : NULL;
++        json_t *jrow;
++
++        fsl->jsign_mb_valid = 1;
++        fsl->jsign_mb = NULL;
++        if ( ctx == NULL || ctx->mb == NULL
++          || JSON_TYPE(ctx->mb->flags) != JSON_TYPE_ARRAY
++          || json_array_length(ctx->mb) <= fsl->sign_mb_y )
++            return fallback;
++        jrow = json_array_get(ctx->mb, fsl->sign_mb_y);
++        if ( jrow == NULL || JSON_TYPE(jrow->flags) != JSON_TYPE_ARRAY
++          || json_array_length(jrow) <= fsl->sign_mb_x )
++            return fallback;
++        fsl->jsign_mb = json_array_get(jrow, fsl->sign_mb_x);
++    }
++
++    jmb = fsl->jsign_mb;
++    if ( jmb == NULL || json_array_length(jmb) <= idx )
++        return fallback;
++
++    if ( JSON_TYPE(jmb->flags) == JSON_TYPE_ARRAY_OF_INTS )
++        return jmb->array_of_ints[idx] != 0;
++
++    if ( JSON_TYPE(jmb->flags) == JSON_TYPE_ARRAY )
++    {
++        json_t *jval = json_array_get(jmb, idx);
++        if ( jval != NULL && JSON_TYPE(jval->flags) == JSON_TYPE_NUMBER && !is_json_null(jval) )
++            return json_int_val(jval) != 0;
++    }
++
++    return fallback;
++}
++
++/* called once per residual block after its levels are read.
++ * level[0..total_coeff) in bitstream order; pos[i] is the bit offset
++ * of level i's code (pos[0..trailing_ones) are the one-bit sign
++ * flags, pos[total_coeff] the end), suffix_length[i] the
++ * suffixLength it was read with. */
++void ffe_h264_levels(
++        const H264Context *h,
++        H264SliceContext *sl,
++        int *level,
++        int total_coeff,
++        int trailing_ones,
++        const int *pos,
++        const int *suffix_length)
++{
++    const AVCodecContext *avctx = h->avctx;
++    FFEditH264SliceContext *fsl = &sl->ffe;
++    AVFrame *f = h->cur_pic_ptr ? h->cur_pic_ptr->f : NULL;
++    int importing = (avctx->ffedit_import & FEAT_MASK_SIGN) != 0 && f != NULL;
++    int exporting = (avctx->ffedit_export & FEAT_MASK_SIGN) != 0;
++
++    if ( !importing && !exporting )
++        return;
++
++    if ( fsl->nb_signs + total_coeff > FFE_H264_MAX_SIGNS )
++    {
++        if ( !fsl->sign_overflow )
++            av_log(ffe_class, AV_LOG_WARNING,
++                   "H.264 macroblock with more than %d coefficients, signs beyond that untouched\n",
++                   FFE_H264_MAX_SIGNS);
++        fsl->sign_overflow = 1;
++        return;
++    }
++
++    for ( int i = 0; i < total_coeff; i++ )
++    {
++        int idx = fsl->nb_signs + i;
++        int sign = level[i] < 0;
++
++        if ( importing )
++        {
++            int want = sign_import_get(fsl, f, idx, sign);
++
++            if ( want != sign )
++            {
++                level[i] = -level[i];
++                if ( h->ffe.out_active )
++                {
++                    FFEditH264Edit *e;
++
++                    if ( i < trailing_ones )
++                    {
++                        /* trailing_ones_sign_flag: 1 = negative */
++                        e = record_edit(fsl, pos[0] + i, 1, FFE_H264_EDIT_BITS, want);
++                        if ( e != NULL )
++                            e->nbits = 1;
++                    }
++                    else
++                    {
++                        e = record_edit(fsl, pos[i], pos[i + 1] - pos[i],
++                                        FFE_H264_EDIT_LEVEL, level[i]);
++                        if ( e != NULL )
++                        {
++                            e->suffix_length = suffix_length[i];
++                            e->first = (i == trailing_ones && trailing_ones < 3);
++                        }
++                    }
++                }
++                sign = want;
++            }
++        }
++
++        fsl->signs[idx] = sign;
++    }
++    fsl->nb_signs += total_coeff;
++}
++
+ /*-------------------------------------------------------------------*/
+ /* packet level                                                      */
+ /*-------------------------------------------------------------------*/
+@@ -210,11 +423,88 @@ static int find_stop_bit(const H2645NAL *nal)
+     return last * 8 + 7 - ff_ctz(nal->data[last]);
+ }
+ 
+-/* rebuild one slice NAL with the recorded mvd edits applied.
++/* n zeros then a one */
++static void put_unary(PutBitContext *pb, int n)
++{
++    put_bits(pb, n + 1, 1);
++}
++
++/* write one CAVLC level (9.2.2.1) the way the decoder reads it in
++ * decode_residual(): levelCode is 2|level|-2 for positive, 2|level|-1
++ * for negative, minus 2 for the first level after fewer than three
++ * trailing ones. The parity carries the sign, so flipping it never
++ * crosses a prefix threshold except the bare unary case. */
++static void put_level(PutBitContext *pb, int level, int suffix_length, int first)
++{
++    int level_code = level > 0 ? 2 * level - 2 : -2 * level - 1;
++    int base;
++    int v;
++    int prefix;
++
++    if ( first )
++        level_code -= 2;
++
++    if ( suffix_length == 0 )
++    {
++        if ( level_code < LEVEL_PREFIX_SHORT )
++        {
++            put_unary(pb, level_code);
++            return;
++        }
++        if ( level_code < LEVEL_PREFIX_SHORT + (1 << LEVEL_SUFFIX_14) )
++        {
++            put_unary(pb, LEVEL_PREFIX_SHORT);
++            put_bits(pb, LEVEL_SUFFIX_14, level_code - LEVEL_PREFIX_SHORT);
++            return;
++        }
++        base = LEVEL_PREFIX_SHORT + (1 << LEVEL_SUFFIX_14);
++    }
++    else
++    {
++        if ( level_code < (LEVEL_PREFIX_ESCAPE << suffix_length) )
++        {
++            put_unary(pb, level_code >> suffix_length);
++            put_bits(pb, suffix_length, level_code & ((1 << suffix_length) - 1));
++            return;
++        }
++        base = LEVEL_PREFIX_ESCAPE << suffix_length;
++    }
++
++    v = level_code - base;
++    if ( v < LEVEL_ESCAPE_RANGE )
++    {
++        put_unary(pb, LEVEL_PREFIX_ESCAPE);
++        put_bits(pb, LEVEL_SUFFIX_ESCAPE, v);
++        return;
++    }
++
++    /* prefix p >= 16 covers v + 4096 in [2^(p-3), 2^(p-2)) */
++    prefix = av_log2(v + LEVEL_ESCAPE_RANGE) + 3;
++    put_unary(pb, prefix);
++    put_bits(pb, prefix - 3, v + LEVEL_ESCAPE_RANGE - (1 << (prefix - 3)));
++}
++
++static void put_edit(PutBitContext *pb, const FFEditH264Edit *e)
++{
++    switch ( e->kind )
++    {
++    case FFE_H264_EDIT_BITS:
++        put_bits(pb, e->nbits, e->val);
++        break;
++    case FFE_H264_EDIT_LEVEL:
++        put_level(pb, e->val, e->suffix_length, e->first);
++        break;
++    default:
++        set_se_golomb(pb, e->val);
++        break;
++    }
++}
++
++/* rebuild one slice NAL with the recorded edits applied.
+  * returns the new RBSP (caller frees) or NULL. */
+ static uint8_t *rebuild_rbsp(
+         const H2645NAL *nal,
+-        const FFEditH264MvdEdit *edits,
++        const FFEditH264Edit *edits,
+         int nb_edits,
+         size_t *out_size)
+ {
+@@ -232,14 +522,14 @@ static uint8_t *rebuild_rbsp(
+     /* edits must be in order and inside the slice data */
+     for ( int i = 0; i < nb_edits; i++ )
+     {
+-        const FFEditH264MvdEdit *e = &edits[i];
++        const FFEditH264Edit *e = &edits[i];
+         if ( e->pos < pos || e->pos + e->len > stop_pos )
+             return NULL;
+         pos = e->pos + e->len;
+     }
+     pos = 0;
+ 
+-    alloc = (stop_pos + 7) / 8 + ((size_t) nb_edits * MAX_SEV_BITS) / 8 + AV_INPUT_BUFFER_PADDING_SIZE;
++    alloc = (stop_pos + 7) / 8 + ((size_t) nb_edits * MAX_EDIT_BITS) / 8 + AV_INPUT_BUFFER_PADDING_SIZE;
+     rbsp = av_malloc(alloc);
+     if ( rbsp == NULL )
+         return NULL;
+@@ -249,11 +539,11 @@ static uint8_t *rebuild_rbsp(
+ 
+     for ( int i = 0; i < nb_edits; i++ )
+     {
+-        const FFEditH264MvdEdit *e = &edits[i];
++        const FFEditH264Edit *e = &edits[i];
+ 
+         copy_bits(&pb, &gb, e->pos - pos);
+         skip_bits_long(&gb, e->len);
+-        set_se_golomb(&pb, e->val);
++        put_edit(&pb, e);
+         pos = e->pos + e->len;
+     }
+     copy_bits(&pb, &gb, stop_pos - pos);
+@@ -279,6 +569,9 @@ void ffe_h264_nal_done(H264Context *h, const H2645NAL *nal)
+     int nb_edits = is_slice ? fsl->nb_edits : 0;
+     size_t off;
+ 
++    /* the last macroblock of the slice has no successor to flush it */
++    sign_flush_mb(h, sl);
++
+     /* edits belong to this NAL only */
+     fsl->nb_edits = 0;
+ 
+@@ -330,7 +623,7 @@ void ffe_h264_check_slice(const H264Context *h, const H264SliceContext *sl)
+     const PPS *pps = h->ps.pps;
+     const SPS *sps = h->ps.sps;
+ 
+-    if ( !ffe_h264_wants_mv(h->avctx) )
++    if ( !ffe_h264_wants_edit(h->avctx) )
+         return;
+ 
+     if ( h->is_avc )
+@@ -338,7 +631,7 @@ void ffe_h264_check_slice(const H264Context *h, const H264SliceContext *sl)
+         av_log(ffe_class, AV_LOG_FATAL,
+                "This H.264 stream is length-prefixed (AVCC, e.g. inside MP4/MKV).\n");
+         av_log(ffe_class, AV_LOG_FATAL,
+-               "FFedit only supports the mv/mv_delta features on raw Annex B H.264 (.264/.h264).\n");
++               "FFedit only supports the mv/mv_delta/q_sign features on raw Annex B H.264 (.264/.h264).\n");
+         exit(1);
+     }
+ 
+@@ -347,7 +640,7 @@ void ffe_h264_check_slice(const H264Context *h, const H264SliceContext *sl)
+         av_log(ffe_class, AV_LOG_FATAL,
+                "This H.264 stream uses CABAC (entropy_coding_mode_flag=1).\n");
+         av_log(ffe_class, AV_LOG_FATAL,
+-               "FFedit only supports the mv/mv_delta features on CAVLC streams.\n");
++               "FFedit only supports the mv/mv_delta/q_sign features on CAVLC streams.\n");
+         av_log(ffe_class, AV_LOG_FATAL,
+                "Re-encode with CAVLC (e.g. x264 -x264-params cabac=0).\n");
+         exit(1);
+@@ -358,7 +651,7 @@ void ffe_h264_check_slice(const H264Context *h, const H264SliceContext *sl)
+         av_log(ffe_class, AV_LOG_FATAL,
+                "This H.264 stream uses field or MBAFF coding.\n");
+         av_log(ffe_class, AV_LOG_FATAL,
+-               "FFedit only supports the mv/mv_delta features on progressive frames.\n");
++               "FFedit only supports the mv/mv_delta/q_sign features on progressive frames.\n");
+         exit(1);
+     }
+ 
+@@ -407,6 +700,11 @@ void ffe_h264_frame_start(H264Context *h)
+     else if ( (avctx->ffedit_import & (1 << FFEDIT_FEAT_MV_DELTA)) != 0 && f->ffedit_sd[FFEDIT_FEAT_MV_DELTA] != NULL )
+         ffe_mv_delta_import_init(jctx, f);
+ 
++    if ( (avctx->ffedit_export & FEAT_MASK_SIGN) != 0 )
++        sign_export_init(jctx, f, h->mb_width, h->mb_height);
++    else if ( (avctx->ffedit_import & FEAT_MASK_SIGN) != 0 && f->ffedit_sd[FFEDIT_FEAT_Q_SIGN] != NULL )
++        sign_import_init(jctx, f);
++
+     fe->frame_active = 1;
+ }
+ 
+@@ -425,15 +723,21 @@ void ffe_h264_frame_end(H264Context *h)
+         ffe_mv_export_cleanup_dirs(FFEDIT_FEAT_MV, f->jctx, f);
+     if ( (avctx->ffedit_export & (1 << FFEDIT_FEAT_MV_DELTA)) != 0 )
+         ffe_mv_export_cleanup_dirs(FFEDIT_FEAT_MV_DELTA, f->jctx, f);
++    if ( (avctx->ffedit_export & FEAT_MASK_SIGN) != 0 )
++        json_object_done(f->jctx, f->ffedit_sd[FFEDIT_FEAT_Q_SIGN]);
+ }
+ 
+ /*-------------------------------------------------------------------*/
+ /* macroblock level                                                  */
+ /*-------------------------------------------------------------------*/
+-void ffe_h264_mb_start(H264SliceContext *sl)
++void ffe_h264_mb_start(H264Context *h, H264SliceContext *sl)
+ {
+     FFEditH264SliceContext *fsl = &sl->ffe;
+ 
++    sign_flush_mb(h, sl);
++    fsl->sign_mb_x = sl->mb_x;
++    fsl->sign_mb_y = sl->mb_y;
++
+     memset(&fsl->mv, 0, sizeof(fsl->mv));
+     memset(&fsl->mv_delta, 0, sizeof(fsl->mv_delta));
+     fsl->mv.mb_y = fsl->mv_delta.mb_y = sl->mb_y;
+@@ -523,21 +827,6 @@ static int import_get(
+     return pair_get(jmb, x_or_y, fallback);
+ }
+ 
+-static void record_edit(FFEditH264SliceContext *fsl, int pos, int len, int val)
+-{
+-    size_t need = (fsl->nb_edits + 1) * sizeof(FFEditH264MvdEdit);
+-    void *tmp = av_fast_realloc(fsl->edits, &fsl->edits_alloc, need);
+-
+-    if ( tmp == NULL )
+-        return;
+-    fsl->edits = tmp;
+-
+-    fsl->edits[fsl->nb_edits].pos = pos;
+-    fsl->edits[fsl->nb_edits].len = len;
+-    fsl->edits[fsl->nb_edits].val = val;
+-    fsl->nb_edits++;
+-}
+-
+ static int clamp_mvd(int mvd)
+ {
+     static int warned = 0;
+@@ -584,7 +873,7 @@ int ffe_h264_mvd(
+     }
+ 
+     if ( h->ffe.out_active && mvd != orig )
+-        record_edit(fsl, pos, len, mvd);
++        record_edit(fsl, pos, len, FFE_H264_EDIT_SEV, mvd);
+ 
+     if ( (avctx->ffedit_export & (1 << FFEDIT_FEAT_MV)) != 0 )
+     {
+diff --git a/libavcodec/ffedit_h264.h b/libavcodec/ffedit_h264.h
+index 259a890..d864bfa 100644
+--- a/libavcodec/ffedit_h264.h
++++ b/libavcodec/ffedit_h264.h
+@@ -43,27 +43,60 @@ struct H264SliceContext;
+  *                                 ^pos,len       ^pos,len
+  *
+  * After the slice is decoded the NAL is rebuilt: bits between the
+- * recorded ranges are copied verbatim, the ranges are re-encoded as
+- * se(v), the stop bit and alignment are regenerated, and emulation
+- * prevention bytes are re-inserted.  Unedited NALs are copied raw.
++ * recorded ranges are copied verbatim, the ranges are re-encoded
++ * (se(v) for mvd, the CAVLC level code for a residual level, a raw
++ * bit for a trailing_ones_sign_flag), the stop bit and alignment are
++ * regenerated, and emulation prevention bytes are re-inserted.
++ * Unedited NALs are copied raw.
++ *
++ * The "q_sign" feature covers every residual coefficient sign in the
++ * order the decoder reads them (luma DC, luma AC/4x4, chroma DC,
++ * chroma AC).  Only the sign moves: |level| is kept, so coeff_token,
++ * total_zeros, run_before and the suffixLength adaptation are
++ * untouched and the slot layout is fixed by the input stream.
+  */
+ 
+-/* one edited mvd: bit offset (from the NAL header byte) and length
+- * of the original se(v) code, and its replacement value. */
+-typedef struct FFEditH264MvdEdit {
++enum FFEditH264EditKind {
++    FFE_H264_EDIT_SEV,      /* val = new se(v) value */
++    FFE_H264_EDIT_BITS,     /* val = new raw bits, nbits wide */
++    FFE_H264_EDIT_LEVEL,    /* val = new signed level */
++};
++
++/* one edit: bit offset (from the NAL header byte) and length of the
++ * original code, and what replaces it. */
++typedef struct FFEditH264Edit {
+     int pos;
+     int len;
++    int kind;
+     int val;
+-} FFEditH264MvdEdit;
++    int nbits;          /* BITS */
++    int suffix_length;  /* LEVEL: suffixLength in force when it was read */
++    int first;          /* LEVEL: first level after < 3 trailing ones (levelCode - 2) */
++} FFEditH264Edit;
++
++/* upper bound on residual coefficient signs in one macroblock:
++ * 4:4:4 luma-style planes (3 x 256) plus 4:2:0 chroma (8 + 120) */
++#define FFE_H264_MAX_SIGNS 1024
+ 
+ /* per-slice state (lives in H264SliceContext) */
+ typedef struct FFEditH264SliceContext {
+     ffe_mv_mb_ctx mv;
+     ffe_mv_mb_ctx mv_delta;
+ 
+-    FFEditH264MvdEdit *edits;
++    FFEditH264Edit *edits;
+     int nb_edits;
+     unsigned edits_alloc;
++
++    /* q_sign: signs of the macroblock being decoded, written to the
++     * JSON when the next one starts (or the NAL ends) */
++    uint8_t signs[FFE_H264_MAX_SIGNS];
++    int nb_signs;
++    int sign_mb_x;
++    int sign_mb_y;
++    int sign_overflow;
++    /* import: this macroblock's JSON entry, looked up once */
++    void *jsign_mb;
++    int jsign_mb_valid;
+ } FFEditH264SliceContext;
+ 
+ /* per-decoder state (lives in H264Context) */
+@@ -86,7 +119,7 @@ typedef struct FFEditH264Context {
+     int out_failed;
+ } FFEditH264Context;
+ 
+-int  ffe_h264_wants_mv(const AVCodecContext *avctx);
++int  ffe_h264_wants_edit(const AVCodecContext *avctx);
+ 
+ void ffe_h264_packet_start(struct H264Context *h, const AVPacket *avpkt);
+ void ffe_h264_packet_end(struct H264Context *h, const AVPacket *avpkt);
+@@ -99,13 +132,20 @@ void ffe_h264_check_slice(const struct H264Context *h,
+ void ffe_h264_frame_start(struct H264Context *h);
+ void ffe_h264_frame_end(struct H264Context *h);
+ 
+-void ffe_h264_mb_start(struct H264SliceContext *sl);
++void ffe_h264_mb_start(struct H264Context *h, struct H264SliceContext *sl);
+ int  ffe_h264_mvd(const struct H264Context *h,
+                   struct H264SliceContext *sl,
+                   int list,
+                   int blockn,
+                   int x_or_y,
+                   int pred);
++void ffe_h264_levels(const struct H264Context *h,
++                     struct H264SliceContext *sl,
++                     int *level,
++                     int total_coeff,
++                     int trailing_ones,
++                     const int *pos,
++                     const int *suffix_length);
+ 
+ void ffe_h264_uninit(struct H264Context *h);
+ 
+diff --git a/libavcodec/h264_cavlc.c b/libavcodec/h264_cavlc.c
+index 2ca82c2..cc487f1 100644
+--- a/libavcodec/h264_cavlc.c
++++ b/libavcodec/h264_cavlc.c
+@@ -400,6 +400,10 @@ static int decode_residual(const H264Context *h, H264SliceContext *sl,
+ {
+     int level[16];
+     int zeros_left, coeff_token, total_coeff, i, trailing_ones, run_before;
++    /* ffedit: where each level's code starts, and the suffixLength it
++     * was read with (see ffe_h264_levels) */
++    int ffe_pos[17];
++    int ffe_sufl[16];
+ 
+     //FIXME put trailing_onex into the context
+ 
+@@ -433,6 +437,7 @@ static int decode_residual(const H264Context *h, H264SliceContext *sl,
+     av_assert2(total_coeff<=16);
+ 
+     i = show_bits(gb, 3);
++    ffe_pos[0] = get_bits_count(gb);
+     skip_bits(gb, trailing_ones);
+     level[0] = 1-((i&4)>>1);
+     level[1] = 1-((i&2)   );
+@@ -444,6 +449,8 @@ static int decode_residual(const H264Context *h, H264SliceContext *sl,
+         int bitsi= show_bits(gb, LEVEL_TAB_BITS);
+         int level_code= cavlc_level_tab[suffix_length][bitsi][0];
+ 
++        ffe_pos[trailing_ones] = get_bits_count(gb);
++        ffe_sufl[trailing_ones] = suffix_length;
+         skip_bits(gb, cavlc_level_tab[suffix_length][bitsi][1]);
+         if(level_code >= 100){
+             prefix= level_code - 100;
+@@ -491,6 +498,8 @@ static int decode_residual(const H264Context *h, H264SliceContext *sl,
+             int bitsi= show_bits(gb, LEVEL_TAB_BITS);
+             level_code= cavlc_level_tab[suffix_length][bitsi][0];
+ 
++            ffe_pos[i] = get_bits_count(gb);
++            ffe_sufl[i] = suffix_length;
+             skip_bits(gb, cavlc_level_tab[suffix_length][bitsi][1]);
+             if(level_code >= 100){
+                 prefix= level_code - 100;
+@@ -518,6 +527,9 @@ static int decode_residual(const H264Context *h, H264SliceContext *sl,
+         }
+     }
+ 
++    ffe_pos[total_coeff] = get_bits_count(gb);
++    ffe_h264_levels(h, sl, level, total_coeff, trailing_ones, ffe_pos, ffe_sufl);
++
+     if(total_coeff == max_coeff)
+         zeros_left=0;
+     else{
+@@ -664,7 +676,7 @@ int ff_h264_decode_mb_cavlc(const H264Context *h, H264SliceContext *sl)
+ 
+     mb_xy = sl->mb_xy = sl->mb_x + sl->mb_y*h->mb_stride;
+ 
+-    ffe_h264_mb_start(sl);
++    ffe_h264_mb_start((H264Context *) h, sl);
+ 
+     ff_tlog(h->avctx, "pic:%d mb:%d/%d\n", h->poc.frame_num, sl->mb_x, sl->mb_y);
+     cbp = 0; /* avoid warning. FIXME: find a solution without slowing
+diff --git a/libavcodec/h264dec.c b/libavcodec/h264dec.c
+index a708dab..7cc941e 100644
+--- a/libavcodec/h264dec.c
++++ b/libavcodec/h264dec.c
+@@ -1147,7 +1147,8 @@ const FFCodec ff_h264_decoder = {
+                              AV_CODEC_CAP_FRAME_THREADS |
+                              AV_CODEC_CAP_FFEDIT_BITSTREAM,
+     .p.ffedit_features     = (1 << FFEDIT_FEAT_MV)
+-                           | (1 << FFEDIT_FEAT_MV_DELTA),
++                           | (1 << FFEDIT_FEAT_MV_DELTA)
++                           | (1 << FFEDIT_FEAT_Q_SIGN),
+     .hw_configs            = (const AVCodecHWConfigInternal *const []) {
+ #if CONFIG_H264_DXVA2_HWACCEL
+                                HWACCEL_DXVA2(h264),
+-- 
+2.55.0
+

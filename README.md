@@ -61,6 +61,12 @@ Any bijection on ℤ↓N is losslessly reversible. glitchlock uses two, both key
 MPEG-2's quantiser scale (`qscale`) is a second carrier: a fixed-width 5-bit
 field with legal values 1–31, which behaves the same way.
 
+H.264 has a third, `q_sign`: the sign of every residual coefficient, a
+one-bit domain. Motion vectors alone leave intra frames untouched, so an
+`mv`-only lock still shows the picture at GOP rate; `q_sign` reaches the
+I-frames. `|level|` never changes, so nothing after a flipped sign moves
+(see [docs/adr/0002-intra-residual.md](docs/adr/0002-intra-residual.md)).
+
 That per-slot domain is not a guess. It is checked against every value in your
 actual file before anything is written, and a violation aborts the lock rather
 than silently wrapping a value into oblivion.
@@ -147,7 +153,7 @@ $ glitchlock lock carrier.mpg -o locked.mpg -m manifest.json --key-file key.bin
 
 | flag | effect |
 |---|---|
-| `--features mv,qscale` | which carriers to use (default: all verified ones present) |
+| `--features mv,q_sign` | which carriers to use (default: all verified ones present) |
 | `--mode full` | `full` (substitute + permute), `substitute`, or `permute` |
 | `--intensity 0.3` | scramble only a key-selected 30% of slots — a dial, not a weakening of reversibility |
 | `--keyless` | store the seed in the manifest; the manifest alone can unwind it |

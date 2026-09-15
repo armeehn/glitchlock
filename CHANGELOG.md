@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- `q_sign` layer for H.264 CAVLC (FFglitch patch `ffglitch/0005`): keyed
+  flips of every residual coefficient sign, so I-frames are scrambled too
+  instead of being left in the clear by `mv`. On by default for H.264,
+  byte-exact unlock. Design record in `docs/adr/0002-intra-residual.md`.
 - MPEG-TS transport: `prepare --container ts`, `ts-lock`, `ts-unlock`. Video
   (H.264, HEVC) and MP2 audio locked inside the container with PTS/DTS kept,
   so stock players stay in sync and the unlock is byte-exact on both
