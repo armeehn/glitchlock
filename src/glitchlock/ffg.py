@@ -134,8 +134,23 @@ H264_CRF = 23
 H264_BFRAMES = 2
 
 
+#: MP2 bitrate for the audio track of a transport-stream carrier.
+TS_AUDIO_KBPS = 192
+CONTAINERS = ("raw", "ts")
+
+
+def _output(fmt: str, container: str) -> List[str]:
+    """Raw elementary stream, or an MPEG-TS with the audio carried as MP2 so
+    the transport can lock it too (see :mod:`glitchlock.transport`)."""
+    if container == "raw":
+        return ["-an", "-f", fmt]
+    if container == "ts":
+        return ["-c:a", "mp2", "-b:a", f"{TS_AUDIO_KBPS}k", "-f", "mpegts"]
+    raise ValueError(f"unknown container {container!r}; use one of {', '.join(CONTAINERS)}")
+
+
 def _transcode_h264(src: str, dst: str, gop: int, closed_gop: bool,
-                    extra: Optional[List[str]]) -> None:
+                    extra: Optional[List[str]], container: str = "raw") -> None:
     """H.264 carrier through the system ffmpeg's libx264: FFglitch's ffgac has
     no H.264 encoder. CAVLC is mandatory (the patched ffedit refuses CABAC);
     repeated SPS/PPS give every IDR a splittable start code for streaming."""
@@ -149,9 +164,9 @@ def _transcode_h264(src: str, dst: str, gop: int, closed_gop: bool,
     if not ffmpeg:
         raise FFglitchMissing("an H.264 carrier needs ffmpeg with libx264 on PATH")
     cmd = [
-        ffmpeg, "-v", "error", "-y", "-i", src, "-an",
+        ffmpeg, "-v", "error", "-y", "-i", src,
         "-c:v", "libx264", "-profile:v", "main", "-crf", str(H264_CRF),
-        "-x264-params", ":".join(params), "-f", "h264",
+        "-x264-params", ":".join(params), *_output("h264", container),
     ]
     if extra:
         cmd += extra
@@ -166,7 +181,7 @@ HEVC_BFRAMES = 2
 
 
 def _transcode_hevc(src: str, dst: str, gop: int, closed_gop: bool,
-                    extra: Optional[List[str]]) -> None:
+                    extra: Optional[List[str]], container: str = "raw") -> None:
     """HEVC carrier through the system ffmpeg's libx265. The patched ffedit
     re-encodes CABAC, so entropy coding is not a constraint, but wavefront
     parallel processing is refused (its per-row context saves would have to
@@ -182,9 +197,9 @@ def _transcode_hevc(src: str, dst: str, gop: int, closed_gop: bool,
     if not ffmpeg:
         raise FFglitchMissing("an HEVC carrier needs ffmpeg with libx265 on PATH")
     cmd = [
-        ffmpeg, "-v", "error", "-y", "-i", src, "-an",
+        ffmpeg, "-v", "error", "-y", "-i", src,
         "-c:v", "libx265", "-crf", str(HEVC_CRF),
-        "-x265-params", ":".join(params), "-f", "hevc",
+        "-x265-params", ":".join(params), *_output("hevc", container),
     ]
     if extra:
         cmd += extra
@@ -200,6 +215,7 @@ def transcode(
     gop: int = 25,
     extra: Optional[List[str]] = None,
     closed_gop: bool = False,
+    container: str = "raw",
 ) -> None:
     """Produce a glitchable carrier elementary stream with ffgac.
 
@@ -212,11 +228,14 @@ def transcode(
     :mod:`glitchlock.stream`.
     """
     if codec == "h264":
-        _transcode_h264(src, dst, gop, closed_gop, extra)
+        _transcode_h264(src, dst, gop, closed_gop, extra, container)
         return
     if codec == "hevc":
-        _transcode_hevc(src, dst, gop, closed_gop, extra)
+        _transcode_hevc(src, dst, gop, closed_gop, extra, container)
         return
+    if container != "raw":
+        # the transport re-splits access units on delimiters only H.264/HEVC carry
+        raise ValueError(f"container {container!r} needs --codec h264 or hevc")
     cmd = [
         ffgac_path(), "-v", "error", "-y", "-i", src, "-an",
         *DEFAULT_TRANSCODE_FLAGS,

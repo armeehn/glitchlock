@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- MPEG-TS transport: `prepare --container ts`, `ts-lock`, `ts-unlock`. Video
+  (H.264, HEVC) and MP2 audio locked inside the container with PTS/DTS kept,
+  so stock players stay in sync and the unlock is byte-exact on both
+  elementary streams. Design record in `docs/adr/0001-transport.md`.
+
 ## 1.0.0 — 2026-09-13
 
 First public release.

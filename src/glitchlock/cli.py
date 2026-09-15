@@ -24,6 +24,7 @@ from .crypto import (
 from .domains import REJECTED_FEATURES, SUPPORTED_FEATURES
 from .manifest import Manifest
 from .stream import StreamSession, run_stream
+from .transport import AudioSpec, TransportSession, demux, run_transport
 from .transform import MODES
 
 
@@ -178,12 +179,18 @@ def cmd_inspect(args) -> int:
 def cmd_prepare(args) -> int:
     ffg.transcode(
         args.input, args.output, codec=args.codec, qscale=args.qscale,
-        gop=args.gop, closed_gop=args.closed_gop,
+        gop=args.gop, closed_gop=args.closed_gop, container=args.container,
     )
-    feats = lockable_features(args.output)
     print(f"carrier: {args.output}")
     print(f"codec:   {args.codec}")
     print(f"sha256:  {sha256_file(args.output)}")
+    if args.container == "ts":
+        # FFedit reads elementary streams only; report the tracks instead
+        with open(args.output, "rb") as fh:
+            program = demux(fh.read())
+        print("tracks:  " + ", ".join(f"{t.codec} (pid {t.pid:#x})" for t in program.tracks))
+        return 0
+    feats = lockable_features(args.output)
     print(f"lockable features: {', '.join(feats) or 'none'}")
     if not feats:
         _err("the produced carrier exposes no reversible feature")
@@ -322,6 +329,47 @@ def cmd_stream_unlock(args) -> int:
     return 0
 
 
+def cmd_ts_lock(args) -> int:
+    key, kdf, keyless, _seed, kem = _resolve_key_for_lock(args)
+    if keyless or kem:
+        _err("transport mode takes a key file or passphrase only")
+        return 2
+    video = StreamSession(
+        codec="", nonce=random_nonce().hex(), features=args.features.split(","),
+        mode=args.mode, intensity=args.intensity, gops=args.gops, kdf=kdf,
+    )
+    audio = None
+    if args.audio_features != "none":
+        audio = AudioSpec(features=args.audio_features.split(","), mode=args.mode,
+                          intensity=args.intensity)
+    session = TransportSession(video=video, audio=audio)
+
+    with open(args.input, "rb") as fh:
+        out, stats = run_transport(fh.read(), session, key, forward=True,
+                                   workers=args.workers)
+    with open(args.output, "wb") as fh:
+        fh.write(out)
+    session.save(args.session)
+
+    _report(f"locked {stats.video_segments} video segments, {stats.frames} frames, "
+            f"{stats.slots_touched} slots; {stats.audio_frames} audio frames")
+    _report(f"session: {args.session}  (needed by the receiver, holds no key)")
+    return 0
+
+
+def cmd_ts_unlock(args) -> int:
+    session = TransportSession.load(args.session)
+    key = _resolve_key_for_unlock(args, session.video.manifest_for(session.video.first_segment))
+
+    with open(args.input, "rb") as fh:
+        out, stats = run_transport(fh.read(), session, key, forward=False,
+                                   workers=args.workers)
+    with open(args.output, "wb") as fh:
+        fh.write(out)
+    _report(f"unlocked {stats.video_segments} video segments, {stats.audio_frames} audio frames")
+    return 0
+
+
 def _noop(_msg: str) -> None:
     pass
 
@@ -454,6 +502,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--closed-gop", action="store_true",
                    help="self-contained GOPs, so the carrier can be split into "
                         "independently lockable stream segments")
+    p.add_argument("--container", choices=ffg.CONTAINERS, default="raw",
+                   help="ts: MPEG-TS with MP2 audio, for ts-lock (h264/hevc only)")
     p.set_defaults(func=cmd_prepare)
 
     p = sub.add_parser("keygen", help="generate an X25519 identity for recipient mode")
@@ -516,6 +566,32 @@ def build_parser() -> argparse.ArgumentParser:
     _add_stream_io(p)
     p.add_argument("--session", required=True, help="record written by stream-lock")
     p.set_defaults(func=cmd_stream_unlock, identity=None)
+
+    p = sub.add_parser("ts-lock",
+                       help="lock the video and MP2 audio inside an MPEG-TS, keeping timestamps")
+    p.add_argument("input", help="transport stream from 'prepare --container ts'")
+    p.add_argument("-o", "--output", required=True)
+    p.add_argument("--session", required=True,
+                   help="where to write the session record the receiver needs")
+    p.add_argument("--features", default="mv", help="video features, comma separated")
+    p.add_argument("--audio-features", default=",".join(mp2.FEATURES),
+                   help="MP2 features, comma separated, or 'none' to leave audio clear")
+    p.add_argument("--mode", choices=MODES, default="full")
+    p.add_argument("--intensity", type=float, default=1.0)
+    p.add_argument("--gops", type=int, default=1, help="GOPs per video segment")
+    p.add_argument("--workers", type=int, default=4)
+    p.add_argument("--key-file")
+    p.add_argument("--password")
+    p.set_defaults(func=cmd_ts_lock, recipient=None, keyless=False)
+
+    p = sub.add_parser("ts-unlock", help="restore a locked MPEG-TS from its session record")
+    p.add_argument("input")
+    p.add_argument("-o", "--output", required=True)
+    p.add_argument("--session", required=True, help="record written by ts-lock")
+    p.add_argument("--workers", type=int, default=4)
+    p.add_argument("--key-file")
+    p.add_argument("--password")
+    p.set_defaults(func=cmd_ts_unlock, identity=None)
 
     p = sub.add_parser("verify", help="lock+unlock in a scratch dir and report exactness")
     p.add_argument("input")

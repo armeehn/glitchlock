@@ -37,7 +37,7 @@ jobs:
             "$GITHUB_SHA"
           git checkout -q FETCH_HEAD
       - run: pip install -e ".[recipients]" pytest
-      - run: pytest tests/test_transform.py tests/test_crypto.py tests/test_stream.py tests/test_pubkey.py -v
+      - run: pytest tests/test_transform.py tests/test_crypto.py tests/test_stream.py tests/test_transport.py tests/test_pubkey.py -v
 
   integration:
     # The real proof: byte-exact round trips through actual MPEG-2, MPEG-4
