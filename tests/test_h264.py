@@ -41,7 +41,7 @@ def test_carrier_is_cavlc_main_with_mv(carrier):
          "stream=codec_name,profile", "-of", "csv=p=0", carrier],
         capture_output=True, text=True)
     assert r.stdout.strip() == "h264,Main"
-    assert select_features(carrier, None) == ["mv"]
+    assert select_features(carrier, None) == ["mv", "q_sign"]
 
 
 def test_lock_unlock_is_byte_exact_and_scrambles(carrier, tmp_path):

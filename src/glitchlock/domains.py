@@ -38,6 +38,15 @@ Empirically verified against FFglitch 0.10.2 (see DESIGN.md "Evidence"):
     MPEG-2 quantiser scale code: a fixed-width 5-bit field, legal values
     ``1..31`` (0 is forbidden), so ``lo = 1, n = 31``.
 
+``q_sign``
+    H.264 CAVLC residual coefficient signs, one ``0``/``1`` per non-zero
+    coefficient of every macroblock (patched FFglitch, ``ffglitch/0005``).
+    Only the sign moves: ``|level|`` stays, so the code lengths that depend
+    on it (coeff_token, total_zeros, run_before, suffixLength) do not, and
+    the slot count per macroblock is fixed by the carrier. Domain ``(0, 2)``.
+    This is the layer that reaches I-frames; ``mv`` alone leaves them in
+    the clear (docs/adr/0002-intra-residual.md).
+
 Deliberately unsupported: ``q_dc``, ``q_dct`` and friends. DC coefficients are
 differentially coded with a variable-length prefix, so an arbitrary write
 changes the number of bits emitted and desynchronises the slice. Round-trip
@@ -53,7 +62,7 @@ from typing import Any, Dict, Iterator, List, Tuple
 from .walk import Path, Slot, walk
 
 #: Features glitchlock can lock and unlock losslessly.
-SUPPORTED_FEATURES = ("mv", "qscale")
+SUPPORTED_FEATURES = ("mv", "qscale", "q_sign")
 
 #: Features FFedit exposes but which are not bit-exact reversible.
 REJECTED_FEATURES = {
@@ -108,7 +117,7 @@ MV_WIDTH_SHIFT = {
 
 #: Features each codec can have locked. Anything absent is refused.
 CODEC_FEATURES = {
-    "h264": ("mv",),
+    "h264": ("mv", "q_sign"),
     "hevc": ("mv",),
     "mpeg1video": ("mv", "qscale"),
     "mpeg2video": ("mv", "qscale"),
@@ -190,9 +199,19 @@ def _qscale_slots(frame_payload: Dict[str, Any], codec: str) -> Iterator[DomainS
         yield (container, key, rel, (1, 31))
 
 
+#: A sign is one bit; a null macroblock (skipped, or no coefficients) has none.
+SIGN_DOMAIN: Domain = (0, 2)
+
+
+def _q_sign_slots(frame_payload: Dict[str, Any], codec: str) -> Iterator[DomainSlot]:
+    for container, key, rel in walk(frame_payload.get("mb") or []):
+        yield (container, key, ("mb",) + rel, SIGN_DOMAIN)
+
+
 _SLOT_FINDERS = {
     "mv": _mv_slots,
     "qscale": _qscale_slots,
+    "q_sign": _q_sign_slots,
 }
 
 

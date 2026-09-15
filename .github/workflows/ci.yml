@@ -62,12 +62,12 @@ jobs:
             "https://x-access-token:${TOKEN}@${GITHUB_SERVER_URL#https://}/${GITHUB_REPOSITORY}.git" \
             "$GITHUB_SHA"
           git checkout -q FETCH_HEAD
-      - name: install FFglitch (patched for H.264 and HEVC, static build)
+      - name: install FFglitch (patched for H.264, HEVC and residual signs, static build)
         # Built by ffglitch/build.sh with STATIC=1 and published as a release
         # asset on this repo. Static because a binary built on Arch wants a
         # newer glibc than this image has; a release asset because a
         # from-source build takes longer than the rest of the job. The stock
-        # ffglitch.org zip would make the H.264/HEVC tests skip, and the no-skip
+        # ffglitch.org zip would make the H.264/HEVC/q_sign tests skip, and the no-skip
         # rule below would then fail the job, which is the right outcome.
         env:
           # GitHub's API lives on its own host; Gitea's under the server URL.
@@ -79,12 +79,12 @@ jobs:
           apt-get update -qq
           apt-get install -y -qq ffmpeg xz-utils
           url=$(curl -sSf -H "Authorization: token $TOKEN" \
-            "$API/releases/tags/ffglitch-hevc-1" \
+            "$API/releases/tags/ffglitch-intra-1" \
             | python3 -c 'import sys,json; print(json.load(sys.stdin)["assets"][0]["browser_download_url"])')
           curl -sSfL -H "Authorization: token $TOKEN" -o ffglitch.tar.xz "$url"
-          echo "c49eb7e34f299b0e043c26a813de2009fcd05471d2117a02e80717a9bf9208a9  ffglitch.tar.xz" | sha256sum -c
+          echo "798f5923f504d40c3556c6b2c925a1676983f0f4a3bd648f95bd615ce5d5d7a3  ffglitch.tar.xz" | sha256sum -c
           tar -xJf ffglitch.tar.xz -C /opt
-          mv /opt/ffglitch-0.10.2-hevc /opt/ffglitch
+          mv /opt/ffglitch-0.10.2-intra /opt/ffglitch
           echo "/opt/ffglitch" >> "$GITHUB_PATH"
       # No pipe here. `ffedit -version | head -1` reports head's exit status,
       # so a completely non-functional ffedit passed this check silently and
