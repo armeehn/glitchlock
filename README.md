@@ -245,7 +245,26 @@ most twice `--workers` are in flight, so memory stays bounded. A stream that
 ends inside a GOP fails on its last piece only; everything before it is out.
 
 See [docs/pdf/streaming.pdf](docs/pdf/streaming.pdf) for the measurements and for what is still
-missing — there is no TS/HLS wrapping and no daemon yet.
+missing — there is no HLS wrapping and no daemon yet.
+
+### Transport (MPEG-TS, video + audio)
+
+A raw elementary stream has no timestamps, and with B-frames nothing
+downstream can rebuild them. `ts-lock` keeps the container instead: it demuxes
+an MPEG-TS, locks the video access units GOP by GOP and the MP2 audio frames,
+and muxes them back with every PTS/DTS unchanged. A stock player plays the
+result as garbage in sync; `ts-unlock` returns the carrier's elementary
+streams byte for byte. H.264 and HEVC video, MP2 audio.
+
+```console
+$ glitchlock prepare film.mkv -o carrier.ts --codec h264 --closed-gop --container ts
+$ glitchlock ts-lock carrier.ts -o locked.ts --session s.json --key-file key.bin
+$ ffplay locked.ts                       # anyone: noise, in sync
+$ glitchlock ts-unlock locked.ts -o restored.ts --session s.json --key-file key.bin
+```
+
+`--audio-features none` leaves the audio in the clear. The route was chosen
+over ffmpeg pipes in [docs/adr/0001-transport.md](docs/adr/0001-transport.md).
 
 ## Audio
 
