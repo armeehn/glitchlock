@@ -247,12 +247,21 @@ class Snapshot:
 
 
 def snapshot(doc: Dict[str, Any], feature: str) -> Snapshot:
+    """One walk per document, one digest update per frame.
+
+    The layout digest only ever meets another digest from the same process
+    (``same_layout`` in ``_run_layer``), so it hashes each frame's list of
+    paths in one ``repr`` rather than one address string per slot. On the
+    q_sign layer that is 1.2 million slots per walk, three walks per layer,
+    and the per-slot string work was most of the lock time.
+    """
     values = array("i")
     digest = hashlib.sha256()
-    for container, key, address in iter_addressed(doc, feature):
-        values.append(container[key])
-        digest.update(address.encode("utf-8"))
-        digest.update(b"\0")
+    for stream_idx, frame_idx, codec, payload in iter_frames(doc, feature):
+        slots = frame_slots(feature, payload, codec)
+        values.extend(container[key] for container, key, _path, _domain in slots)
+        digest.update(f"{stream_idx}/{frame_idx}/{len(slots)}\0".encode("utf-8"))
+        digest.update(repr([path for _c, _k, path, _d in slots]).encode("utf-8"))
     return Snapshot(values, digest.digest())
 
 
