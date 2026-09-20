@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Lock and unlock walk each layer's slots with one digest update per frame
+  instead of one address string per slot. `q_sign` on the 320x240 test
+  carrier locks in about 60 % of the time; output bytes unchanged.
 - `q_sign` layer for H.264 CAVLC (FFglitch patch `ffglitch/0005`): keyed
   flips of every residual coefficient sign, so I-frames are scrambled too
   instead of being left in the clear by `mv`. On by default for H.264,
